@@ -7,7 +7,7 @@ Tools:
   k8s_top_pods      — pod CPU/memory usage
   k8s_top_nodes     — node CPU/memory usage
   k8s_find_issues   — comprehensive cluster health scan
-  k8s_get_yaml      — get resource as YAML
+  k8s_get_yaml      — get resource as YAML (strips noise by default)
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 
 from k8s_mcp.kubectl import KubectlError, kubectl, kubectl_json
 from k8s_mcp.formatters import node_conditions_summary, severity_icon
@@ -24,6 +24,8 @@ from k8s_mcp.formatters import node_conditions_summary, severity_icon
 # ---------------------------------------------------------------------------
 # Tool definitions
 # ---------------------------------------------------------------------------
+
+_RO = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
 
 DIAGNOSTIC_TOOLS: list[Tool] = [
     Tool(
@@ -50,6 +52,7 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=_RO,
     ),
     Tool(
         name="k8s_logs",
@@ -82,6 +85,7 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=_RO,
     ),
     Tool(
         name="k8s_top_pods",
@@ -95,6 +99,7 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=_RO,
     ),
     Tool(
         name="k8s_top_nodes",
@@ -105,6 +110,7 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=_RO,
     ),
     Tool(
         name="k8s_find_issues",
@@ -129,10 +135,15 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                 },
             },
         },
+        annotations=_RO,
     ),
     Tool(
         name="k8s_get_yaml",
-        description="Get the full YAML definition of any Kubernetes resource.",
+        description=(
+            "Get the YAML definition of any Kubernetes resource. "
+            "Managed fields and last-applied-configuration annotations are stripped by default "
+            "to reduce noise. Set raw=true to get the full unfiltered YAML."
+        ),
         inputSchema={
             "type": "object",
             "required": ["resource_type", "resource_name"],
@@ -141,8 +152,14 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                 "resource_name": {"type": "string"},
                 "namespace": {"type": "string"},
                 "context": {"type": "string"},
+                "raw": {
+                    "type": "boolean",
+                    "description": "Return full unfiltered YAML including managed fields. Default false.",
+                    "default": False,
+                },
             },
         },
+        annotations=_RO,
     ),
 ]
 
@@ -184,7 +201,11 @@ async def handle_logs(args: dict) -> list[TextContent]:
         out = await kubectl(cmd, context=ctx, namespace=ns)
     except KubectlError as e:
         return _err(str(e))
-    return [TextContent(type="text", text=out or "(no log output)")]
+
+    if not out:
+        return [TextContent(type="text", text="(no log output)")]
+
+    return [TextContent(type="text", text=out)]
 
 
 async def handle_top_pods(args: dict) -> list[TextContent]:
@@ -256,10 +277,30 @@ async def handle_get_yaml(args: dict) -> list[TextContent]:
     rname = args["resource_name"]
     ctx = args.get("context")
     ns = args.get("namespace")
+    raw = args.get("raw", False)
+
+    if raw:
+        try:
+            out = await kubectl(["get", rtype, rname, "-o", "yaml"], context=ctx, namespace=ns)
+        except KubectlError as e:
+            return _err(str(e))
+        return [TextContent(type="text", text=out)]
+
+    # Fetch as JSON, strip noise fields, convert to YAML
     try:
-        out = await kubectl(["get", rtype, rname, "-o", "yaml"], context=ctx, namespace=ns)
+        data = await kubectl_json(["get", rtype, rname], context=ctx, namespace=ns)
     except KubectlError as e:
         return _err(str(e))
+
+    metadata = data.get("metadata", {})
+    metadata.pop("managedFields", None)
+    annotations = metadata.get("annotations", {})
+    annotations.pop("kubectl.kubernetes.io/last-applied-configuration", None)
+    if not annotations and "annotations" in metadata:
+        del metadata["annotations"]
+
+    import yaml
+    out = yaml.dump(data, default_flow_style=False, sort_keys=False)
     return [TextContent(type="text", text=out)]
 
 

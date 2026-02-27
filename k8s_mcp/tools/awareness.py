@@ -15,9 +15,150 @@ Tools:
 
 from __future__ import annotations
 
-from mcp.types import TextContent, Tool
+import asyncio
+from collections import Counter
+
+from mcp.types import TextContent, Tool, ToolAnnotations
 
 from k8s_mcp.kubectl import KubectlError, kubectl
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+async def _gather(*coros):
+    return await asyncio.gather(*coros)
+
+
+def _err(msg: str) -> list[TextContent]:
+    return [TextContent(type="text", text=f"Error: {msg}")]
+
+
+def _find_col_index(headers: list[str], *candidates: str) -> int | None:
+    """Find the index of a column by name (case-insensitive). Returns None if not found."""
+    for candidate in candidates:
+        for i, h in enumerate(headers):
+            if h.upper() == candidate.upper():
+                return i
+    return None
+
+
+def _parse_table_rows(output: str) -> tuple[list[str], list[list[str]]]:
+    """Parse kubectl tabular output into header list and row-value lists."""
+    lines = output.strip().splitlines()
+    if not lines:
+        return [], []
+    headers = lines[0].split()
+    rows = [line.split() for line in lines[1:] if line.strip()]
+    return headers, rows
+
+
+def _col_values(headers: list[str], rows: list[list[str]], *col_names: str) -> list[str]:
+    """Extract values from a specific column across all rows."""
+    idx = _find_col_index(headers, *col_names)
+    if idx is None:
+        return []
+    return [row[idx] for row in rows if idx < len(row)]
+
+
+# ---------------------------------------------------------------------------
+# Summary builders for existing list handlers
+# ---------------------------------------------------------------------------
+
+def _summarize_pods(output: str) -> str:
+    """Prepend a summary like '15 pods (12 Running, 2 Pending, 1 CrashLoopBackOff)'."""
+    headers, rows = _parse_table_rows(output)
+    if not rows:
+        return output
+    statuses = _col_values(headers, rows, "STATUS")
+    if not statuses:
+        return output
+    counts = Counter(statuses)
+    total = len(statuses)
+    parts = ", ".join(f"{v} {k}" for k, v in counts.most_common())
+    summary = f"{total} pods ({parts})"
+    return f"{summary}\n\n{output}"
+
+
+def _summarize_deployments(output: str) -> str:
+    """Prepend a summary with total count and any degraded deployments."""
+    headers, rows = _parse_table_rows(output)
+    if not rows:
+        return output
+    ready_idx = _find_col_index(headers, "READY")
+    if ready_idx is None:
+        return f"{len(rows)} deployments\n\n{output}"
+    degraded = 0
+    for row in rows:
+        if ready_idx < len(row):
+            parts = row[ready_idx].split("/")
+            if len(parts) == 2 and parts[0] != parts[1]:
+                degraded += 1
+    total = len(rows)
+    if degraded:
+        summary = f"{total} deployments ({degraded} degraded — ready != desired)"
+    else:
+        summary = f"{total} deployments (all healthy)"
+    return f"{summary}\n\n{output}"
+
+
+def _summarize_nodes(output: str) -> str:
+    """Prepend a summary counting Ready vs NotReady nodes."""
+    headers, rows = _parse_table_rows(output)
+    if not rows:
+        return output
+    statuses = _col_values(headers, rows, "STATUS")
+    if not statuses:
+        return output
+    counts = Counter(statuses)
+    total = len(statuses)
+    ready = counts.get("Ready", 0)
+    not_ready = total - ready
+    if not_ready:
+        summary = f"{total} nodes ({ready} Ready, {not_ready} NotReady)"
+    else:
+        summary = f"{total} nodes (all Ready)"
+    return f"{summary}\n\n{output}"
+
+
+def _summarize_services(output: str) -> str:
+    """Prepend a summary counting services by TYPE."""
+    headers, rows = _parse_table_rows(output)
+    if not rows:
+        return output
+    types = _col_values(headers, rows, "TYPE")
+    if not types:
+        return f"{len(rows)} services\n\n{output}"
+    counts = Counter(types)
+    total = len(types)
+    parts = ", ".join(f"{v} {k}" for k, v in counts.most_common())
+    summary = f"{total} services ({parts})"
+    return f"{summary}\n\n{output}"
+
+
+def _summarize_events(output: str, warnings_only: bool) -> str:
+    """Prepend a summary counting events."""
+    headers, rows = _parse_table_rows(output)
+    if not rows:
+        return output
+    total = len(rows)
+    qualifier = " warning" if warnings_only else ""
+    summary = f"{total}{qualifier} events"
+    if not warnings_only:
+        types = _col_values(headers, rows, "TYPE")
+        if types:
+            counts = Counter(types)
+            parts = ", ".join(f"{v} {k}" for k, v in counts.most_common())
+            summary = f"{total} events ({parts})"
+    return f"{summary}\n\n{output}"
+
+
+# ---------------------------------------------------------------------------
+# Shared schema constants
+# ---------------------------------------------------------------------------
+
+_RO_ANNOTATIONS = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +181,7 @@ AWARENESS_TOOLS: list[Tool] = [
                 },
             },
         },
+        annotations=_RO_ANNOTATIONS,
     ),
     Tool(
         name="k8s_get_contexts",
@@ -48,6 +190,7 @@ AWARENESS_TOOLS: list[Tool] = [
             "type": "object",
             "properties": {},
         },
+        annotations=_RO_ANNOTATIONS,
     ),
     Tool(
         name="k8s_list_namespaces",
@@ -58,6 +201,7 @@ AWARENESS_TOOLS: list[Tool] = [
                 "context": {"type": "string", "description": "Kubeconfig context name."},
             },
         },
+        annotations=_RO_ANNOTATIONS,
     ),
     Tool(
         name="k8s_list_nodes",
@@ -71,6 +215,7 @@ AWARENESS_TOOLS: list[Tool] = [
                 "context": {"type": "string", "description": "Kubeconfig context name."},
             },
         },
+        annotations=_RO_ANNOTATIONS,
     ),
     Tool(
         name="k8s_list_pods",
@@ -98,6 +243,7 @@ AWARENESS_TOOLS: list[Tool] = [
                 "context": {"type": "string", "description": "Kubeconfig context name."},
             },
         },
+        annotations=_RO_ANNOTATIONS,
     ),
     Tool(
         name="k8s_list_deployments",
@@ -113,6 +259,7 @@ AWARENESS_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=_RO_ANNOTATIONS,
     ),
     Tool(
         name="k8s_list_services",
@@ -127,6 +274,7 @@ AWARENESS_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=_RO_ANNOTATIONS,
     ),
     Tool(
         name="k8s_list_images",
@@ -143,6 +291,7 @@ AWARENESS_TOOLS: list[Tool] = [
                 "context": {"type": "string", "description": "Kubeconfig context name."},
             },
         },
+        annotations=_RO_ANNOTATIONS,
     ),
     Tool(
         name="k8s_list_events",
@@ -167,6 +316,7 @@ AWARENESS_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=_RO_ANNOTATIONS,
     ),
 ]
 
@@ -213,7 +363,7 @@ async def handle_list_nodes(args: dict) -> list[TextContent]:
         out = await kubectl(["get", "nodes", "-o", "wide"], context=ctx)
     except KubectlError as e:
         return _err(str(e))
-    return [TextContent(type="text", text=out)]
+    return [TextContent(type="text", text=_summarize_nodes(out))]
 
 
 async def handle_list_pods(args: dict) -> list[TextContent]:
@@ -230,7 +380,7 @@ async def handle_list_pods(args: dict) -> list[TextContent]:
         out = await kubectl(cmd, context=ctx, namespace=ns, all_namespaces=all_ns)
     except KubectlError as e:
         return _err(str(e))
-    return [TextContent(type="text", text=out)]
+    return [TextContent(type="text", text=_summarize_pods(out))]
 
 
 async def handle_list_deployments(args: dict) -> list[TextContent]:
@@ -241,7 +391,7 @@ async def handle_list_deployments(args: dict) -> list[TextContent]:
         out = await kubectl(["get", "deployments"], context=ctx, namespace=ns, all_namespaces=all_ns)
     except KubectlError as e:
         return _err(str(e))
-    return [TextContent(type="text", text=out)]
+    return [TextContent(type="text", text=_summarize_deployments(out))]
 
 
 async def handle_list_services(args: dict) -> list[TextContent]:
@@ -252,7 +402,7 @@ async def handle_list_services(args: dict) -> list[TextContent]:
         out = await kubectl(["get", "services"], context=ctx, namespace=ns, all_namespaces=all_ns)
     except KubectlError as e:
         return _err(str(e))
-    return [TextContent(type="text", text=out)]
+    return [TextContent(type="text", text=_summarize_services(out))]
 
 
 async def handle_list_images(args: dict) -> list[TextContent]:
@@ -290,7 +440,7 @@ async def handle_list_events(args: dict) -> list[TextContent]:
         out = await kubectl(cmd, context=ctx, namespace=ns, all_namespaces=all_ns)
     except KubectlError as e:
         return _err(str(e))
-    return [TextContent(type="text", text=out)]
+    return [TextContent(type="text", text=_summarize_events(out, warnings_only))]
 
 
 # ---------------------------------------------------------------------------
@@ -308,18 +458,3 @@ AWARENESS_HANDLERS = {
     "k8s_list_images": handle_list_images,
     "k8s_list_events": handle_list_events,
 }
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-import asyncio  # noqa: E402 (needed after TYPE_CHECKING guard)
-
-
-async def _gather(*coros):
-    return await asyncio.gather(*coros)
-
-
-def _err(msg: str) -> list[TextContent]:
-    return [TextContent(type="text", text=f"Error: {msg}")]

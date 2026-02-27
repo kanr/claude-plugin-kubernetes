@@ -1,19 +1,24 @@
 """
 Claude MCP Plugin — Kubernetes
 
-Exposes 21 tools across three categories:
-  • Awareness   (8) — cluster state, contexts, nodes, pods, services, events
-  • Diagnostics (6) — describe, logs, metrics, health scan, YAML export
-  • Remediation (7) — restart, scale, delete, rollback, apply, patch, node ops
+Exposes kubectl-backed tools over MCP stdio transport across three categories:
+  • Awareness   — cluster state, contexts, nodes, pods, services, events
+  • Diagnostics — describe, logs, metrics, health scan, YAML export
+  • Remediation — restart, scale, delete, rollback, apply, patch, node ops
+
+Environment variables:
+  K8S_MCP_READ_ONLY=true  — only register read-only tools
 
 Run with:
-    python -m src.server
+    python -m k8s_mcp.server
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+from datetime import datetime, timezone
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -28,18 +33,29 @@ from k8s_mcp.tools.diagnostics import DIAGNOSTIC_HANDLERS, DIAGNOSTIC_TOOLS
 from k8s_mcp.tools.remediation import REMEDIATION_HANDLERS, REMEDIATION_TOOLS
 
 # ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+READ_ONLY = os.environ.get("K8S_MCP_READ_ONLY", "").lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
 # Server setup
 # ---------------------------------------------------------------------------
 
 server = Server("kubernetes")
 
-ALL_TOOLS = AWARENESS_TOOLS + DIAGNOSTIC_TOOLS + REMEDIATION_TOOLS
+if READ_ONLY:
+    ALL_TOOLS = AWARENESS_TOOLS + DIAGNOSTIC_TOOLS
+    ALL_HANDLERS: dict = {**AWARENESS_HANDLERS, **DIAGNOSTIC_HANDLERS}
+else:
+    ALL_TOOLS = AWARENESS_TOOLS + DIAGNOSTIC_TOOLS + REMEDIATION_TOOLS
+    ALL_HANDLERS = {
+        **AWARENESS_HANDLERS,
+        **DIAGNOSTIC_HANDLERS,
+        **REMEDIATION_HANDLERS,
+    }
 
-ALL_HANDLERS: dict = {
-    **AWARENESS_HANDLERS,
-    **DIAGNOSTIC_HANDLERS,
-    **REMEDIATION_HANDLERS,
-}
+WRITE_TOOLS = set(REMEDIATION_HANDLERS.keys())
 
 
 @server.list_tools()
@@ -58,6 +74,14 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             isError=True,
         )
 
+    # Audit logging for write operations
+    if name in WRITE_TOOLS:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        safe_args = {k: v for k, v in args.items() if k != "manifest"}
+        if "manifest" in args:
+            safe_args["manifest_size"] = f"{len(args['manifest'])} bytes"
+        print(f"[AUDIT] {ts} {name} {safe_args}", file=sys.stderr)
+
     try:
         content = await handler(args)
         return CallToolResult(content=content)
@@ -73,8 +97,9 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
 # ---------------------------------------------------------------------------
 
 async def _run() -> None:
+    mode = "read-only" if READ_ONLY else "full"
     print(
-        f"kubernetes MCP server starting — {len(ALL_TOOLS)} tools registered",
+        f"kubernetes MCP server starting — {len(ALL_TOOLS)} tools registered ({mode} mode)",
         file=sys.stderr,
     )
     async with stdio_server() as (read_stream, write_stream):

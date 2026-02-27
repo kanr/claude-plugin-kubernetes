@@ -85,7 +85,13 @@ async def kubectl_json(
         namespace=namespace,
         all_namespaces=all_namespaces,
     )
-    return json.loads(output)
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        raise KubectlError(
+            "Response too large to parse as JSON (likely truncated at 10 MB). "
+            "Try narrowing your query with a namespace or label selector."
+        )
 
 
 async def kubectl_stdin(

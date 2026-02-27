@@ -17,7 +17,7 @@ Tools:
 
 from __future__ import annotations
 
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 
 from k8s_mcp.kubectl import KubectlError, kubectl, kubectl_stdin
 
@@ -43,6 +43,7 @@ REMEDIATION_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True),
     ),
     Tool(
         name="k8s_scale",
@@ -69,6 +70,7 @@ REMEDIATION_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True),
     ),
     Tool(
         name="k8s_delete_pod",
@@ -91,6 +93,7 @@ REMEDIATION_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
     ),
     Tool(
         name="k8s_rollback_deployment",
@@ -111,6 +114,7 @@ REMEDIATION_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
     ),
     Tool(
         name="k8s_apply_manifest",
@@ -139,6 +143,7 @@ REMEDIATION_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
     ),
     Tool(
         name="k8s_patch_resource",
@@ -167,6 +172,7 @@ REMEDIATION_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
     ),
     Tool(
         name="k8s_node_operation",
@@ -201,6 +207,7 @@ REMEDIATION_TOOLS: list[Tool] = [
                 "context": {"type": "string"},
             },
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
     ),
 ]
 
