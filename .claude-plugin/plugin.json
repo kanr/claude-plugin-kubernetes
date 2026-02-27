@@ -1,0 +1,10 @@
+{
+  "name": "kubernetes",
+  "description": "Kubernetes cluster awareness, diagnostics, and remediation via kubectl. Adds 21 tools for inspecting pods, deployments, services, events, logs, and performing safe cluster operations.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Connor Aitken",
+    "url": "https://github.com/kanr"
+  },
+  "repository": "https://github.com/kanr/claude-plugin-kubernetes"
+}
