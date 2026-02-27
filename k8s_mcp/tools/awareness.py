@@ -2,15 +2,26 @@
 Cluster awareness tools (read-only).
 
 Tools:
-  k8s_cluster_info      — cluster endpoint, server version, current context
-  k8s_get_contexts      — list kubeconfig contexts
-  k8s_list_namespaces   — list namespaces with status
-  k8s_list_nodes        — list nodes with roles, status, ages
-  k8s_list_pods         — list pods (filter by namespace / label selector)
-  k8s_list_deployments  — list deployments
-  k8s_list_services     — list services
-  k8s_list_events       — list events (filter by namespace / Warning-only)
-  k8s_list_images       — list container images running across pods
+  k8s_cluster_info        — cluster endpoint, server version, current context
+  k8s_get_contexts        — list kubeconfig contexts
+  k8s_list_namespaces     — list namespaces with status
+  k8s_list_nodes          — list nodes with roles, status, ages
+  k8s_list_pods           — list pods (filter by namespace / label selector)
+  k8s_list_deployments    — list deployments
+  k8s_list_services       — list services
+  k8s_list_events         — list events (filter by namespace / Warning-only)
+  k8s_list_images         — list container images running across pods
+  k8s_list_statefulsets   — list statefulsets
+  k8s_list_ingresses      — list ingresses
+  k8s_list_jobs           — list jobs
+  k8s_list_cronjobs       — list cronjobs
+  k8s_list_configmaps     — list configmaps (metadata only)
+  k8s_list_secrets        — list secrets (metadata only, no data exposed)
+  k8s_list_pvcs           — list persistent volume claims
+  k8s_list_daemonsets     — list daemonsets
+  k8s_list_hpa            — list horizontal pod autoscalers
+  k8s_list_networkpolicies — list network policies
+  k8s_api_resources       — list available API resource types
 """
 
 from __future__ import annotations
@@ -45,7 +56,11 @@ def _find_col_index(headers: list[str], *candidates: str) -> int | None:
 
 
 def _parse_table_rows(output: str) -> tuple[list[str], list[list[str]]]:
-    """Parse kubectl tabular output into header list and row-value lists."""
+    """Parse kubectl tabular output into header list and row-value lists.
+
+    Returns (headers, rows) where rows is a list of split-line values.
+    Handles the case where output is empty or has no data rows.
+    """
     lines = output.strip().splitlines()
     if not lines:
         return [], []
@@ -155,8 +170,17 @@ def _summarize_events(output: str, warnings_only: bool) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Shared schema constants
+# Namespace/all_namespaces/context schema — reused across many tools
 # ---------------------------------------------------------------------------
+
+_NS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "namespace": {"type": "string", "description": "Namespace filter."},
+        "all_namespaces": {"type": "boolean", "default": False},
+        "context": {"type": "string", "description": "Kubeconfig context name."},
+    },
+}
 
 _RO_ANNOTATIONS = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
 
@@ -318,6 +342,105 @@ AWARENESS_TOOLS: list[Tool] = [
         },
         annotations=_RO_ANNOTATIONS,
     ),
+    # --- New tools ---
+    Tool(
+        name="k8s_list_statefulsets",
+        description=(
+            "List StatefulSets with desired/ready replica counts and age. "
+            "Use all_namespaces=true for cluster-wide view."
+        ),
+        inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_list_ingresses",
+        description=(
+            "List Ingress resources with hosts, paths, backends, and address info."
+        ),
+        inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_list_jobs",
+        description=(
+            "List Jobs with their completions, duration, and age."
+        ),
+        inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_list_cronjobs",
+        description=(
+            "List CronJobs with their schedule, last schedule time, and active job count."
+        ),
+        inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_list_configmaps",
+        description=(
+            "List ConfigMaps with their name and age. Shows metadata only, not data contents."
+        ),
+        inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_list_secrets",
+        description=(
+            "List Secrets with their name, type, and age. Shows metadata only — "
+            "never exposes secret data."
+        ),
+        inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_list_pvcs",
+        description=(
+            "List PersistentVolumeClaims with status, volume, capacity, access modes, "
+            "and storage class."
+        ),
+        inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_list_daemonsets",
+        description=(
+            "List DaemonSets with desired/current/ready counts and age."
+        ),
+        inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_list_hpa",
+        description=(
+            "List HorizontalPodAutoscalers with target, min/max replicas, "
+            "current replicas, and metrics."
+        ),
+        inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_list_networkpolicies",
+        description=(
+            "List NetworkPolicies with pod selector and age."
+        ),
+        inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_api_resources",
+        description=(
+            "List available API resource types in the cluster (including CRDs). "
+            "Useful for discovering what resource kinds are available."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "context": {"type": "string", "description": "Kubeconfig context name."},
+            },
+        },
+        annotations=_RO_ANNOTATIONS,
+    ),
 ]
 
 
@@ -443,6 +566,69 @@ async def handle_list_events(args: dict) -> list[TextContent]:
     return [TextContent(type="text", text=_summarize_events(out, warnings_only))]
 
 
+# --- New handlers ---
+
+async def _simple_list(args: dict, resource: str) -> list[TextContent]:
+    """Generic handler for simple list operations."""
+    ctx = args.get("context")
+    ns = args.get("namespace")
+    all_ns = args.get("all_namespaces", False)
+    try:
+        out = await kubectl(["get", resource], context=ctx, namespace=ns, all_namespaces=all_ns)
+    except KubectlError as e:
+        return _err(str(e))
+    return [TextContent(type="text", text=out)]
+
+
+async def handle_list_statefulsets(args: dict) -> list[TextContent]:
+    return await _simple_list(args, "statefulsets")
+
+
+async def handle_list_ingresses(args: dict) -> list[TextContent]:
+    return await _simple_list(args, "ingress")
+
+
+async def handle_list_jobs(args: dict) -> list[TextContent]:
+    return await _simple_list(args, "jobs")
+
+
+async def handle_list_cronjobs(args: dict) -> list[TextContent]:
+    return await _simple_list(args, "cronjobs")
+
+
+async def handle_list_configmaps(args: dict) -> list[TextContent]:
+    return await _simple_list(args, "configmaps")
+
+
+async def handle_list_secrets(args: dict) -> list[TextContent]:
+    return await _simple_list(args, "secrets")
+
+
+async def handle_list_pvcs(args: dict) -> list[TextContent]:
+    return await _simple_list(args, "pvc")
+
+
+async def handle_list_daemonsets(args: dict) -> list[TextContent]:
+    return await _simple_list(args, "daemonsets")
+
+
+async def handle_list_hpa(args: dict) -> list[TextContent]:
+    return await _simple_list(args, "hpa")
+
+
+async def handle_list_networkpolicies(args: dict) -> list[TextContent]:
+    return await _simple_list(args, "networkpolicies")
+
+
+async def handle_api_resources(args: dict) -> list[TextContent]:
+    ctx = args.get("context")
+    try:
+        out = await kubectl(["api-resources"], context=ctx)
+    except KubectlError as e:
+        return _err(str(e))
+    return [TextContent(type="text", text=out)]
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -457,4 +643,15 @@ AWARENESS_HANDLERS = {
     "k8s_list_services": handle_list_services,
     "k8s_list_images": handle_list_images,
     "k8s_list_events": handle_list_events,
+    "k8s_list_statefulsets": handle_list_statefulsets,
+    "k8s_list_ingresses": handle_list_ingresses,
+    "k8s_list_jobs": handle_list_jobs,
+    "k8s_list_cronjobs": handle_list_cronjobs,
+    "k8s_list_configmaps": handle_list_configmaps,
+    "k8s_list_secrets": handle_list_secrets,
+    "k8s_list_pvcs": handle_list_pvcs,
+    "k8s_list_daemonsets": handle_list_daemonsets,
+    "k8s_list_hpa": handle_list_hpa,
+    "k8s_list_networkpolicies": handle_list_networkpolicies,
+    "k8s_api_resources": handle_api_resources,
 }
