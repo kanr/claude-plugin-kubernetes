@@ -3,17 +3,20 @@ Diagnostic tools — read-only operations for troubleshooting.
 
 Tools:
   k8s_describe      — kubectl describe any resource
-  k8s_logs          — get pod logs (tail, container, previous)
+  k8s_logs          — get pod logs (tail, container, previous, error filtering)
   k8s_top_pods      — pod CPU/memory usage
   k8s_top_nodes     — node CPU/memory usage
   k8s_find_issues   — comprehensive cluster health scan
-  k8s_get_yaml      — get resource as YAML (strips noise by default)
+  k8s_get_yaml      — get resource as YAML
+  k8s_self_test     — MCP plugin health check
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
+from datetime import datetime, timezone
 
 from mcp.types import TextContent, Tool, ToolAnnotations
 
@@ -82,6 +85,11 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Show logs since a relative duration, e.g. '5m', '1h'.",
                 },
+                "filter": {
+                    "type": "string",
+                    "enum": ["errors"],
+                    "description": "Filter log output to show only lines matching common error patterns.",
+                },
                 "context": {"type": "string"},
             },
         },
@@ -117,8 +125,9 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
         description=(
             "Perform a comprehensive cluster health scan and report all detected problems. "
             "Checks: non-Running/non-Succeeded pods, high-restart pods, nodes with "
-            "pressure/NotReady conditions, deployments with unavailable replicas, and "
-            "recent Warning events. Run this first when diagnosing cluster problems."
+            "pressure/NotReady conditions, deployments/statefulsets with unavailable replicas, "
+            "failed jobs, pending PVCs, and recent Warning events. "
+            "Run this first when diagnosing cluster problems."
         ),
         inputSchema={
             "type": "object",
@@ -161,6 +170,18 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
         },
         annotations=_RO,
     ),
+    Tool(
+        name="k8s_self_test",
+        description=(
+            "Run a health check on the MCP plugin itself. Verifies kubectl binary, "
+            "cluster connectivity, authentication, and metrics-server."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+        annotations=_RO,
+    ),
 ]
 
 
@@ -180,6 +201,12 @@ async def handle_describe(args: dict) -> list[TextContent]:
     return [TextContent(type="text", text=out)]
 
 
+_ERROR_PATTERNS = re.compile(
+    r"ERROR|Exception|FATAL|panic:|Traceback|FAIL|error:|level=error|\"level\":\"error\"",
+    re.IGNORECASE,
+)
+
+
 async def handle_logs(args: dict) -> list[TextContent]:
     pod = args["pod_name"]
     ctx = args.get("context")
@@ -188,6 +215,7 @@ async def handle_logs(args: dict) -> list[TextContent]:
     tail = args.get("tail", 100)
     previous = args.get("previous", False)
     since = args.get("since")
+    log_filter = args.get("filter")
 
     cmd = ["logs", pod, f"--tail={tail}"]
     if container:
@@ -205,7 +233,41 @@ async def handle_logs(args: dict) -> list[TextContent]:
     if not out:
         return [TextContent(type="text", text="(no log output)")]
 
+    if log_filter == "errors":
+        out = _filter_error_lines(out)
+
     return [TextContent(type="text", text=out)]
+
+
+def _filter_error_lines(raw: str) -> str:
+    """Filter log output to lines matching error patterns, with 2 lines of context."""
+    lines = raw.splitlines()
+    total = len(lines)
+    matching_indices: set[int] = set()
+
+    for i, line in enumerate(lines):
+        if _ERROR_PATTERNS.search(line):
+            # Include 2 lines of context before and after
+            for j in range(max(0, i - 2), min(total, i + 3)):
+                matching_indices.add(j)
+
+    if not matching_indices:
+        return f"{total} lines fetched, 0 match error patterns."
+
+    match_count = sum(1 for i, line in enumerate(lines) if _ERROR_PATTERNS.search(line))
+    sorted_indices = sorted(matching_indices)
+
+    # Build output with gap markers
+    result_lines: list[str] = []
+    prev_idx = -2
+    for idx in sorted_indices:
+        if idx > prev_idx + 1:
+            result_lines.append("---")
+        result_lines.append(lines[idx])
+        prev_idx = idx
+
+    header = f"{total} lines fetched, {match_count} match error patterns (showing filtered)"
+    return header + "\n" + "\n".join(result_lines)
 
 
 async def handle_top_pods(args: dict) -> list[TextContent]:
@@ -240,35 +302,118 @@ async def handle_find_issues(args: dict) -> list[TextContent]:
     all_ns = ns is None
     restart_threshold = args.get("restart_threshold", 5)
 
-    # Run all checks in parallel
+    # Run all 7 checks in parallel
     results = await asyncio.gather(
         _check_pods(ctx, ns, all_ns, restart_threshold),
         _check_nodes(ctx),
         _check_deployments(ctx, ns, all_ns),
+        _check_statefulsets(ctx, ns, all_ns),
+        _check_jobs(ctx, ns, all_ns),
+        _check_pvcs(ctx, ns, all_ns),
         _check_events(ctx, ns, all_ns),
         return_exceptions=True,
     )
 
-    pod_issues, node_issues, deploy_issues, event_issues = results
-    sections: list[str] = []
+    pod_result, node_result, deploy_result, sts_result, job_result, pvc_result, event_result = results
 
-    def _add_section(title: str, items, icon: str):
-        if isinstance(items, Exception):
-            sections.append(f"{icon} {title}\n  (scan failed: {items})")
-        elif items:
-            body = "\n".join(f"  {line}" for line in items)
-            sections.append(f"{icon} {title}\n{body}")
+    # Unpack pod result — it returns (critical, warning) tuple
+    if isinstance(pod_result, Exception):
+        pod_critical: list[str] = []
+        pod_warning: list[str] = []
+        pod_error = pod_result
+    else:
+        pod_critical, pod_warning = pod_result
+        pod_error = None
 
-    _add_section("Pod Issues", pod_issues, severity_icon("critical"))
-    _add_section("Node Issues", node_issues, severity_icon("critical"))
-    _add_section("Deployment Issues", deploy_issues, severity_icon("warning"))
-    _add_section("Recent Warning Events (last 20)", event_issues, severity_icon("warning"))
+    # Unpack events — returns (event_lines, event_map) tuple
+    if isinstance(event_result, Exception):
+        event_lines: list[str] = []
+        event_map: dict[str, list[str]] = {}
+        event_error = event_result
+    else:
+        event_lines, event_map = event_result
+        event_error = None
 
-    if not sections:
+    # Cross-reference events with pod issues
+    pod_critical = _cross_reference_events(pod_critical, event_map)
+    pod_warning = _cross_reference_events(pod_warning, event_map)
+
+    # Collect all issues into severity tiers
+    critical_items: list[str] = []
+    warning_items: list[str] = []
+    node_items: list[str] = []
+
+    # Pod critical issues
+    if pod_error:
+        critical_items.append(f"(pod scan failed: {pod_error})")
+    else:
+        critical_items.extend(pod_critical)
+
+    # Pod warning issues
+    if not pod_error:
+        warning_items.extend(pod_warning)
+
+    # Node issues — always in their own section but counted as critical
+    if isinstance(node_result, Exception):
+        node_items.append(f"(node scan failed: {node_result})")
+    else:
+        node_items.extend(node_result)
+
+    # Deployment issues -> warning
+    if isinstance(deploy_result, Exception):
+        warning_items.append(f"(deployment scan failed: {deploy_result})")
+    else:
+        warning_items.extend(deploy_result)
+
+    # StatefulSet issues -> warning
+    if isinstance(sts_result, Exception):
+        warning_items.append(f"(statefulset scan failed: {sts_result})")
+    else:
+        warning_items.extend(sts_result)
+
+    # Job issues -> warning
+    if isinstance(job_result, Exception):
+        warning_items.append(f"(job scan failed: {job_result})")
+    else:
+        warning_items.extend(job_result)
+
+    # PVC issues -> warning
+    if isinstance(pvc_result, Exception):
+        warning_items.append(f"(pvc scan failed: {pvc_result})")
+    else:
+        warning_items.extend(pvc_result)
+
+    total_issues = len(critical_items) + len(warning_items) + len(node_items)
+
+    if total_issues == 0 and not event_lines:
         return [TextContent(type="text", text="No issues detected. Cluster looks healthy.")]
 
-    header = f"Cluster Health Scan — {len([s for s in [pod_issues, node_issues, deploy_issues, event_issues] if s and not isinstance(s, Exception)])} categories with findings\n"
-    report = header + "\n\n".join(sections)
+    n_critical = len(critical_items) + len(node_items)
+    n_warning = len(warning_items)
+
+    header = f"Cluster Health Scan — {total_issues} issues found ({n_critical} critical, {n_warning} warning)"
+    sections: list[str] = [header]
+
+    if critical_items:
+        body = "\n".join(f"  {line}" for line in critical_items)
+        sections.append(f"{severity_icon('critical')} CRITICAL:\n{body}")
+
+    if warning_items:
+        body = "\n".join(f"  {line}" for line in warning_items)
+        sections.append(f"{severity_icon('warning')} WARNING:\n{body}")
+
+    if node_items:
+        body = "\n".join(f"  {line}" for line in node_items)
+        sections.append(f"{severity_icon('critical')} NODE ISSUES:\n{body}")
+
+    if event_lines:
+        if event_error:
+            sections.append(f"{severity_icon('warning')} RECENT WARNING EVENTS (last 20)\n  (event scan failed: {event_error})")
+        else:
+            body = "\n".join(f"  {line}" for line in event_lines)
+            sections.append(f"{severity_icon('warning')} RECENT WARNING EVENTS (last 20):\n{body}")
+
+    report = "\n\n".join(sections)
     return [TextContent(type="text", text=report)]
 
 
@@ -304,11 +449,110 @@ async def handle_get_yaml(args: dict) -> list[TextContent]:
     return [TextContent(type="text", text=out)]
 
 
+async def handle_self_test(args: dict) -> list[TextContent]:
+    """Run health checks on the MCP plugin itself."""
+    from k8s_mcp.tools.awareness import AWARENESS_TOOLS
+    from k8s_mcp.tools.remediation import REMEDIATION_TOOLS
+
+    total_tools = len(DIAGNOSTIC_TOOLS) + len(AWARENESS_TOOLS) + len(REMEDIATION_TOOLS)
+
+    # Run all 4 checks in parallel
+    results = await asyncio.gather(
+        kubectl(["version", "--client", "--short"]),
+        kubectl(["cluster-info"], timeout_override=5),
+        kubectl(["auth", "can-i", "get", "pods", "--all-namespaces"]),
+        kubectl(["top", "nodes"]),
+        return_exceptions=True,
+    )
+
+    version_result, cluster_result, auth_result, metrics_result = results
+
+    lines: list[str] = ["Plugin Self-Test Results"]
+
+    # kubectl binary
+    if isinstance(version_result, Exception):
+        lines.append(f"  kubectl binary:     FAILED ({version_result})")
+    else:
+        # Extract version string — first line typically has version info
+        ver = version_result.strip().splitlines()[0] if version_result.strip() else "unknown"
+        lines.append(f"  kubectl binary:     OK ({ver})")
+
+    # Cluster connection
+    if isinstance(cluster_result, Exception):
+        lines.append(f"  Cluster connection: FAILED ({cluster_result})")
+    else:
+        # Extract cluster endpoint from cluster-info output
+        first_line = cluster_result.strip().splitlines()[0] if cluster_result.strip() else ""
+        # Try to extract URL from the output
+        url_match = re.search(r"https?://[^\s]+", first_line)
+        endpoint = url_match.group(0) if url_match else "connected"
+        lines.append(f"  Cluster connection: OK ({endpoint})")
+
+    # Authentication
+    if isinstance(auth_result, Exception):
+        lines.append(f"  Authentication:     FAILED ({auth_result})")
+    else:
+        result_text = auth_result.strip().lower()
+        if result_text == "yes":
+            lines.append("  Authentication:     OK (can list pods)")
+        else:
+            lines.append(f"  Authentication:     LIMITED ({auth_result.strip()})")
+
+    # Metrics server
+    if isinstance(metrics_result, Exception):
+        lines.append("  Metrics server:     NOT AVAILABLE")
+    else:
+        lines.append("  Metrics server:     OK")
+
+    lines.append(f"  Tools registered:   {total_tools}")
+
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
 # ---------------------------------------------------------------------------
 # k8s_find_issues helpers
 # ---------------------------------------------------------------------------
 
-async def _check_pods(ctx, ns, all_ns, restart_threshold) -> list[str]:
+def _format_age(timestamp_str: str) -> str:
+    """Convert an ISO timestamp to a human-readable relative age string."""
+    try:
+        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        delta = now - ts
+        total_seconds = int(delta.total_seconds())
+        if total_seconds < 60:
+            return f"{total_seconds}s"
+        elif total_seconds < 3600:
+            return f"{total_seconds // 60}m"
+        elif total_seconds < 86400:
+            return f"{total_seconds // 3600}h"
+        else:
+            return f"{total_seconds // 86400}d"
+    except (ValueError, TypeError):
+        return "unknown"
+
+
+def _cross_reference_events(issues: list[str], event_map: dict[str, list[str]]) -> list[str]:
+    """Append related event info to issue lines when a matching event exists."""
+    if not event_map:
+        return issues
+    enriched: list[str] = []
+    for line in issues:
+        matched = False
+        for obj_name, event_entries in event_map.items():
+            if obj_name in line and event_entries:
+                # Take the most recent related event
+                enriched.append(line)
+                enriched.append(f"    -> Related event: {event_entries[-1]}")
+                matched = True
+                break
+        if not matched:
+            enriched.append(line)
+    return enriched
+
+
+async def _check_pods(ctx, ns, all_ns, restart_threshold) -> tuple[list[str], list[str]]:
+    """Check pods and split issues into critical and warning severity."""
     data = await kubectl_json(
         ["get", "pods"],
         context=ctx,
@@ -316,31 +560,59 @@ async def _check_pods(ctx, ns, all_ns, restart_threshold) -> list[str]:
         all_namespaces=all_ns,
     )
     items = data.get("items", [])
-    issues: list[str] = []
+    critical: list[str] = []
+    warning: list[str] = []
+
+    _CRITICAL_REASONS = {"CrashLoopBackOff", "Error", "OOMKilled", "ImagePullBackOff", "ErrImagePull", "CreateContainerError"}
 
     for pod in items:
         pod_ns = pod["metadata"]["namespace"]
         pod_name = pod["metadata"]["name"]
         phase = pod.get("status", {}).get("phase", "Unknown")
 
-        if phase not in ("Running", "Succeeded", "Completed"):
-            reason = pod.get("status", {}).get("reason", "")
-            issues.append(f"[{pod_ns}] {pod_name}  phase={phase} {reason}")
-
-        # Check high restarts
+        # Check container statuses for critical states first
+        container_critical = False
         for cs in pod.get("status", {}).get("containerStatuses", []):
-            restarts = cs.get("restartCount", 0)
             cname = cs.get("name", "")
-            if restarts >= restart_threshold:
-                state = cs.get("state", {})
-                waiting = state.get("waiting", {})
-                reason = waiting.get("reason", "")
-                issues.append(
-                    f"[{pod_ns}] {pod_name}/{cname}  restarts={restarts}"
-                    + (f" ({reason})" if reason else "")
-                )
+            restarts = cs.get("restartCount", 0)
+            state = cs.get("state", {})
+            waiting = state.get("waiting", {})
+            terminated = state.get("terminated", {})
+            reason = waiting.get("reason", "") or terminated.get("reason", "")
 
-    return issues
+            if reason in _CRITICAL_REASONS:
+                container_critical = True
+                msg = f"[{pod_ns}/{pod_name}] {reason}"
+                if reason == "CrashLoopBackOff" or reason in ("Error", "OOMKilled"):
+                    msg += f' — container "{cname}" restarted {restarts} times'
+                    msg += f'\n    -> Suggested: k8s_logs pod_name="{pod_name}" namespace="{pod_ns}" previous=true'
+                elif reason in ("ImagePullBackOff", "ErrImagePull"):
+                    image = cs.get("image", "unknown")
+                    msg += f' — image "{image}" not found'
+                    msg += f'\n    -> Suggested: k8s_describe resource_type="pod" resource_name="{pod_name}" namespace="{pod_ns}"'
+                elif reason == "CreateContainerError":
+                    detail = waiting.get("message", "")
+                    msg += f" — {detail}" if detail else ""
+                    msg += f'\n    -> Suggested: k8s_describe resource_type="pod" resource_name="{pod_name}" namespace="{pod_ns}"'
+                critical.append(msg)
+
+            elif restarts >= restart_threshold:
+                critical.append(
+                    f"[{pod_ns}/{pod_name}] container \"{cname}\" restarted {restarts} times"
+                    + (f" ({reason})" if reason else "")
+                    + f'\n    -> Suggested: k8s_logs pod_name="{pod_name}" namespace="{pod_ns}" previous=true'
+                )
+                container_critical = True
+
+        # Non-running pods that aren't already flagged as critical
+        if phase not in ("Running", "Succeeded", "Completed") and not container_critical:
+            pod_reason = pod.get("status", {}).get("reason", "")
+            line = f"[{pod_ns}/{pod_name}] phase={phase}"
+            if pod_reason:
+                line += f" ({pod_reason})"
+            warning.append(line)
+
+    return critical, warning
 
 
 async def _check_nodes(ctx) -> list[str]:
@@ -378,27 +650,149 @@ async def _check_deployments(ctx, ns, all_ns) -> list[str]:
 
         if unavailable and unavailable > 0:
             issues.append(
-                f"[{dep_ns}] {dep_name}  desired={desired} ready={ready} unavailable={unavailable}"
+                f"[{dep_ns}/{dep_name}] {unavailable}/{desired} replicas unavailable"
             )
         elif desired and ready == 0:
-            issues.append(f"[{dep_ns}] {dep_name}  desired={desired} ready=0 (all replicas down)")
+            issues.append(f"[{dep_ns}/{dep_name}] {desired}/{desired} replicas unavailable (all replicas down)")
 
     return issues
 
 
-async def _check_events(ctx, ns, all_ns) -> list[str]:
+async def _check_statefulsets(ctx, ns, all_ns) -> list[str]:
+    """Check statefulsets for unavailable replicas."""
+    data = await kubectl_json(
+        ["get", "statefulsets"],
+        context=ctx,
+        namespace=ns,
+        all_namespaces=all_ns,
+    )
+    items = data.get("items", [])
+    issues: list[str] = []
+
+    for sts in items:
+        sts_ns = sts["metadata"]["namespace"]
+        sts_name = sts["metadata"]["name"]
+        status = sts.get("status", {})
+        desired = sts.get("spec", {}).get("replicas", 0)
+        ready = status.get("readyReplicas", 0) or 0
+
+        if desired and ready < desired:
+            unavailable = desired - ready
+            issues.append(
+                f"[{sts_ns}/{sts_name}] statefulset {unavailable}/{desired} replicas unavailable"
+            )
+
+    return issues
+
+
+async def _check_jobs(ctx, ns, all_ns) -> list[str]:
+    """Check jobs for failures and stuck states."""
+    data = await kubectl_json(
+        ["get", "jobs"],
+        context=ctx,
+        namespace=ns,
+        all_namespaces=all_ns,
+    )
+    items = data.get("items", [])
+    issues: list[str] = []
+
+    for job in items:
+        job_ns = job["metadata"]["namespace"]
+        job_name = job["metadata"]["name"]
+        status = job.get("status", {})
+        failed = status.get("failed", 0) or 0
+        succeeded = status.get("succeeded", 0) or 0
+        active = status.get("active", 0) or 0
+        conditions = status.get("conditions", [])
+
+        # Check for Failed condition first (most specific)
+        failed_condition = None
+        for cond in conditions:
+            if cond.get("type") == "Failed" and cond.get("status") == "True":
+                failed_condition = cond
+                break
+
+        if failed_condition:
+            reason = failed_condition.get("reason", "unknown")
+            issues.append(f"[{job_ns}/{job_name}] Job failed ({reason})")
+        elif failed > 0 and succeeded == 0:
+            issues.append(f"[{job_ns}/{job_name}] Job has {failed} failure(s), no successes")
+        elif active == 0 and succeeded == 0 and failed == 0:
+            # Job exists but has no active, succeeded, or failed pods — stuck
+            # Only flag if the job doesn't have a completionTime (not already done)
+            if not status.get("completionTime"):
+                issues.append(f"[{job_ns}/{job_name}] Job appears stuck (no active/succeeded/failed pods)")
+
+    return issues
+
+
+async def _check_pvcs(ctx, ns, all_ns) -> list[str]:
+    """Check PVCs for non-Bound phases."""
+    data = await kubectl_json(
+        ["get", "pvc"],
+        context=ctx,
+        namespace=ns,
+        all_namespaces=all_ns,
+    )
+    items = data.get("items", [])
+    issues: list[str] = []
+
+    for pvc in items:
+        pvc_ns = pvc["metadata"]["namespace"]
+        pvc_name = pvc["metadata"]["name"]
+        phase = pvc.get("status", {}).get("phase", "Unknown")
+
+        if phase != "Bound":
+            # Try to get storage class info for context
+            sc = pvc.get("spec", {}).get("storageClassName", "")
+            detail = f' (storageclass "{sc}")' if sc else ""
+            issues.append(f"[{pvc_ns}/{pvc_name}] PVC phase={phase}{detail}")
+
+    return issues
+
+
+async def _check_events(ctx, ns, all_ns) -> tuple[list[str], dict[str, list[str]]]:
+    """Fetch warning events as JSON and return formatted lines plus a name->messages map."""
     try:
-        out = await kubectl(
+        data = await kubectl_json(
             ["get", "events", "--field-selector=type=Warning", "--sort-by=.lastTimestamp"],
             context=ctx,
             namespace=ns,
             all_namespaces=all_ns,
         )
     except KubectlError:
-        return []
+        return [], {}
 
-    lines = [l for l in out.splitlines() if l.strip() and not l.startswith("NAMESPACE")]
-    return lines[-20:]  # last 20 warning events
+    items = data.get("items", [])
+
+    # Build a map of involvedObject.name -> list of event descriptions
+    event_map: dict[str, list[str]] = {}
+    formatted_lines: list[str] = []
+
+    for event in items:
+        obj = event.get("involvedObject", {})
+        obj_name = obj.get("name", "")
+        obj_kind = obj.get("kind", "")
+        obj_ns = event.get("metadata", {}).get("namespace", "")
+        reason = event.get("reason", "")
+        message = event.get("message", "")
+        last_ts = event.get("lastTimestamp", "") or event.get("metadata", {}).get("creationTimestamp", "")
+        count = event.get("count", 1)
+        age = _format_age(last_ts) if last_ts else "unknown"
+
+        line = f"[{obj_ns}/{obj_name}] {obj_kind} {reason}: {message}"
+        if count and count > 1:
+            line += f" (x{count})"
+        line += f" ({age} ago)"
+
+        formatted_lines.append(line)
+
+        # Index by object name for cross-referencing
+        entry = f"{reason}: {message} ({age} ago)"
+        event_map.setdefault(obj_name, []).append(entry)
+
+    # Return last 20 events
+    return formatted_lines[-20:], event_map
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +806,7 @@ DIAGNOSTIC_HANDLERS = {
     "k8s_top_nodes": handle_top_nodes,
     "k8s_find_issues": handle_find_issues,
     "k8s_get_yaml": handle_get_yaml,
+    "k8s_self_test": handle_self_test,
 }
 
 

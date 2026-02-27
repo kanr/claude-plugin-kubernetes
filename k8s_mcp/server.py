@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 from datetime import datetime, timezone
 
@@ -27,10 +28,12 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
     CallToolResult,
+    GetPromptResult,
     ListToolsResult,
     TextContent,
 )
 
+from k8s_mcp.prompts import ALL_PROMPTS, get_prompt
 from k8s_mcp.tools.awareness import AWARENESS_HANDLERS, AWARENESS_TOOLS
 from k8s_mcp.tools.diagnostics import DIAGNOSTIC_HANDLERS, DIAGNOSTIC_TOOLS
 from k8s_mcp.tools.remediation import REMEDIATION_HANDLERS, REMEDIATION_TOOLS
@@ -96,6 +99,54 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
 
 
 # ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+
+@server.list_prompts()
+async def list_prompts() -> list:
+    return ALL_PROMPTS
+
+
+@server.get_prompt()
+async def handle_get_prompt(
+    name: str, arguments: dict[str, str] | None
+) -> GetPromptResult:
+    return get_prompt(name, arguments)
+
+
+# ---------------------------------------------------------------------------
+# Startup preflight
+# ---------------------------------------------------------------------------
+
+async def _preflight() -> None:
+    """Check kubectl availability and cluster connectivity before serving."""
+    if not shutil.which("kubectl"):
+        print(
+            "FATAL: kubectl not found on PATH. Install kubectl and try again.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    from k8s_mcp.kubectl import kubectl, KubectlError
+
+    try:
+        version = await kubectl(["version", "--client", "--short"])
+        print(f"kubectl client: {version}", file=sys.stderr)
+    except KubectlError as e:
+        print(f"WARNING: kubectl version check failed: {e}", file=sys.stderr)
+
+    try:
+        await kubectl(["cluster-info"], timeout_override=5)
+        print("Cluster connectivity: OK", file=sys.stderr)
+    except KubectlError:
+        print(
+            "WARNING: Cluster unreachable. Tools will fail until a valid context is configured.",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -105,6 +156,7 @@ async def _run() -> None:
         f"kubernetes MCP server starting — {len(ALL_TOOLS)} tools registered ({mode} mode)",
         file=sys.stderr,
     )
+    await _preflight()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
