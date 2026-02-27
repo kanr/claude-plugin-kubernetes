@@ -12,6 +12,7 @@ from k8s_mcp.tools.awareness import (
     handle_get_contexts,
     handle_list_deployments,
     handle_list_events,
+    handle_list_images,
     handle_list_namespaces,
     handle_list_nodes,
     handle_list_pods,
@@ -80,3 +81,17 @@ async def test_list_services_by_namespace():
 async def test_get_contexts():
     result = await handle_get_contexts({})
     assert "minikube" in result[0].text
+
+
+async def test_list_images_all_namespaces():
+    result = await handle_list_images({"all_namespaces": True, "context": "minikube"})
+    assert "Error" not in result[0].text
+    text = result[0].text
+    assert "IMAGE" in text
+    assert "coredns" in text.lower() or "kube-proxy" in text.lower()
+
+
+async def test_list_images_by_namespace():
+    result = await handle_list_images({"namespace": "kube-system", "context": "minikube"})
+    assert "Error" not in result[0].text
+    assert "IMAGE" in result[0].text

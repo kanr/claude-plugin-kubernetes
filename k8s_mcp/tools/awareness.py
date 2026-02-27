@@ -10,6 +10,7 @@ Tools:
   k8s_list_deployments  — list deployments
   k8s_list_services     — list services
   k8s_list_events       — list events (filter by namespace / Warning-only)
+  k8s_list_images       — list container images running across pods
 """
 
 from __future__ import annotations
@@ -128,6 +129,22 @@ AWARENESS_TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="k8s_list_images",
+        description=(
+            "List container images running across pods. Shows namespace, pod name, "
+            "container name, and image for each container. Use all_namespaces=true "
+            "for a cluster-wide view."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "namespace": {"type": "string", "description": "Namespace filter."},
+                "all_namespaces": {"type": "boolean", "default": False},
+                "context": {"type": "string", "description": "Kubeconfig context name."},
+            },
+        },
+    ),
+    Tool(
         name="k8s_list_events",
         description=(
             "List recent cluster events sorted by time. Set warnings_only=true to show "
@@ -238,6 +255,27 @@ async def handle_list_services(args: dict) -> list[TextContent]:
     return [TextContent(type="text", text=out)]
 
 
+async def handle_list_images(args: dict) -> list[TextContent]:
+    ctx = args.get("context")
+    ns = args.get("namespace")
+    all_ns = args.get("all_namespaces", False)
+
+    cmd = [
+        "get", "pods",
+        "-o", "custom-columns="
+              "NAMESPACE:.metadata.namespace,"
+              "POD:.metadata.name,"
+              "CONTAINER:.spec.containers[*].name,"
+              "IMAGE:.spec.containers[*].image",
+    ]
+
+    try:
+        out = await kubectl(cmd, context=ctx, namespace=ns, all_namespaces=all_ns)
+    except KubectlError as e:
+        return _err(str(e))
+    return [TextContent(type="text", text=out)]
+
+
 async def handle_list_events(args: dict) -> list[TextContent]:
     ctx = args.get("context")
     ns = args.get("namespace")
@@ -267,6 +305,7 @@ AWARENESS_HANDLERS = {
     "k8s_list_pods": handle_list_pods,
     "k8s_list_deployments": handle_list_deployments,
     "k8s_list_services": handle_list_services,
+    "k8s_list_images": handle_list_images,
     "k8s_list_events": handle_list_events,
 }
 

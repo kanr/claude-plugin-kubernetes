@@ -16,6 +16,7 @@ from k8s_mcp.tools.awareness import (
     handle_get_contexts,
     handle_list_deployments,
     handle_list_events,
+    handle_list_images,
     handle_list_namespaces,
     handle_list_nodes,
     handle_list_pods,
@@ -196,3 +197,60 @@ async def test_handle_list_events_no_filter_by_default():
         await handle_list_events({})
     cmd = mock_kctl.call_args[0][0]
     assert not any("Warning" in arg for arg in cmd)
+
+
+# ---------------------------------------------------------------------------
+# handle_list_images
+# ---------------------------------------------------------------------------
+
+IMAGES_OUTPUT = (
+    "NAMESPACE     POD                  CONTAINER   IMAGE\n"
+    "kube-system   coredns-abc          coredns     registry.k8s.io/coredns/coredns:v1.10.1\n"
+    "default       myapp-xyz            app         nginx:1.25\n"
+)
+
+
+async def test_handle_list_images_success():
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value=IMAGES_OUTPUT):
+        result = await handle_list_images({})
+    assert len(result) == 1
+    assert isinstance(result[0], TextContent)
+    text = result[0].text
+    assert "IMAGE" in text
+    assert "nginx:1.25" in text
+    assert "coredns" in text
+
+
+async def test_handle_list_images_uses_custom_columns():
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value=IMAGES_OUTPUT) as mock_kctl:
+        await handle_list_images({})
+    cmd = mock_kctl.call_args[0][0]
+    assert "get" in cmd
+    assert "pods" in cmd
+    assert any("custom-columns" in arg for arg in cmd)
+
+
+async def test_handle_list_images_with_namespace():
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value=IMAGES_OUTPUT) as mock_kctl:
+        await handle_list_images({"namespace": "kube-system"})
+    assert mock_kctl.call_args.kwargs["namespace"] == "kube-system"
+    assert mock_kctl.call_args.kwargs["all_namespaces"] is False
+
+
+async def test_handle_list_images_all_namespaces():
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value=IMAGES_OUTPUT) as mock_kctl:
+        await handle_list_images({"all_namespaces": True})
+    assert mock_kctl.call_args.kwargs["all_namespaces"] is True
+
+
+async def test_handle_list_images_passes_context():
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value=IMAGES_OUTPUT) as mock_kctl:
+        await handle_list_images({"context": "prod"})
+    assert mock_kctl.call_args.kwargs["context"] == "prod"
+
+
+async def test_handle_list_images_error():
+    with patch("k8s_mcp.tools.awareness.kubectl", side_effect=KubectlError("forbidden")):
+        result = await handle_list_images({})
+    assert "Error" in result[0].text
+    assert "forbidden" in result[0].text
