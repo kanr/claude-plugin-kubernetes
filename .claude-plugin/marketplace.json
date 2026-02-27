@@ -1,0 +1,17 @@
+{
+  "name": "kanr-plugins",
+  "owner": {
+    "name": "Connor Aitken",
+    "email": "kanr@protonmail.com"
+  },
+  "plugins": [
+    {
+      "name": "kubernetes",
+      "source": {
+        "source": "github",
+        "repo": "kanr/claude-plugin-kubernetes"
+      },
+      "description": "Kubernetes cluster awareness, diagnostics, and remediation via kubectl. 21 tools for pods, deployments, services, events, logs, and cluster operations."
+    }
+  ]
+}
