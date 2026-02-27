@@ -48,13 +48,13 @@ Add the following to `~/Library/Application Support/Claude/claude_desktop_config
   "mcpServers": {
     "kubernetes": {
       "command": "uvx",
-      "args": ["--from", "claude-plugin-kubernetes", "k8s-mcp"]
+      "args": ["--from", "git+https://github.com/kanr/claude-plugin-kubernetes", "k8s-mcp"]
     }
   }
 }
 ```
 
-Requires [`uv`](https://docs.astral.sh/uv/getting-started/installation/) to be installed.
+Requires [`uv`](https://docs.astral.sh/uv/getting-started/installation/) to be installed. Once published to PyPI, the `git+https://...` can be replaced with simply `claude-plugin-kubernetes`.
 
 ### Claude Code (CLI)
 

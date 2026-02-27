@@ -2,7 +2,7 @@
   "mcpServers": {
     "kubernetes": {
       "command": "uvx",
-      "args": ["--from", "claude-plugin-kubernetes", "k8s-mcp"]
+      "args": ["--from", "git+https://github.com/kanr/claude-plugin-kubernetes", "k8s-mcp"]
     }
   }
 }
