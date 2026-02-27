@@ -7,7 +7,10 @@ Exposes kubectl-backed tools over MCP stdio transport across three categories:
   • Remediation — restart, scale, delete, rollback, apply, patch, node ops
 
 Environment variables:
-  K8S_MCP_READ_ONLY=true  — only register read-only tools
+  K8S_MCP_READ_ONLY=true           — only register read-only tools
+  K8S_MCP_ALLOWED_CONTEXTS=a,b     — restrict which kubeconfig contexts can be used
+  K8S_MCP_NAMESPACE_BLOCKLIST=...  — block writes to namespaces (default: kube-system,kube-public,kube-node-lease)
+  K8S_MCP_NAMESPACE_ALLOWLIST=...  — exclusive write allowlist (if set, only these are writable)
 
 Run with:
     python -m k8s_mcp.server

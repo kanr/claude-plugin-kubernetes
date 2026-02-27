@@ -17,9 +17,31 @@ Tools:
 
 from __future__ import annotations
 
+import os
+
+import yaml
 from mcp.types import TextContent, Tool, ToolAnnotations
 
-from k8s_mcp.kubectl import KubectlError, kubectl, kubectl_stdin
+from k8s_mcp.kubectl import (
+    KubectlError,
+    check_namespace_writable,
+    kubectl,
+    kubectl_json,
+    kubectl_stdin,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_BLOCKED_KINDS: set[str] = {
+    "ClusterRole",
+    "ClusterRoleBinding",
+    "MutatingWebhookConfiguration",
+    "ValidatingWebhookConfiguration",
+    "CustomResourceDefinition",
+    "PersistentVolume",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +71,8 @@ REMEDIATION_TOOLS: list[Tool] = [
         name="k8s_scale",
         description=(
             "[RISK: MEDIUM] Scale the replica count of a deployment or statefulset. "
-            "Scaling to 0 stops all pods. Scaling down may affect availability."
+            "Scaling to 0 stops all pods. Scaling down may affect availability. "
+            "Scaling to 0 requires confirm_scale_to_zero=true."
         ),
         inputSchema={
             "type": "object",
@@ -66,6 +89,11 @@ REMEDIATION_TOOLS: list[Tool] = [
                     "minimum": 0,
                     "description": "Target replica count.",
                 },
+                "confirm_scale_to_zero": {
+                    "type": "boolean",
+                    "description": "Required when replicas=0. Confirms intent to stop all pods.",
+                    "default": False,
+                },
                 "namespace": {"type": "string"},
                 "context": {"type": "string"},
             },
@@ -77,7 +105,9 @@ REMEDIATION_TOOLS: list[Tool] = [
         description=(
             "[RISK: LOW-MEDIUM] Delete a pod so that its controller (Deployment, "
             "StatefulSet, DaemonSet) recreates it. Use force=true to immediately "
-            "terminate without graceful shutdown — use only for stuck/unresponsive pods."
+            "terminate without graceful shutdown — use only for stuck/unresponsive pods. "
+            "Note: if this is the only replica, there will be brief downtime until "
+            "the controller recreates it."
         ),
         inputSchema={
             "type": "object",
@@ -121,7 +151,8 @@ REMEDIATION_TOOLS: list[Tool] = [
         description=(
             "[RISK: MEDIUM] Apply a Kubernetes manifest (YAML or JSON) to the cluster "
             "via `kubectl apply -f -`. Creates or updates resources. Use for deploying "
-            "ConfigMaps, Deployments, Services, etc."
+            "ConfigMaps, Deployments, Services, etc. Cluster-scoped resources "
+            "(ClusterRole, MutatingWebhookConfiguration, etc.) are blocked by default."
         ),
         inputSchema={
             "type": "object",
@@ -220,6 +251,7 @@ async def handle_restart_deployment(args: dict) -> list[TextContent]:
     name = args["deployment_name"]
     ctx = args.get("context")
     ns = args.get("namespace")
+    check_namespace_writable(ns)
     try:
         out = await kubectl(["rollout", "restart", f"deployment/{name}"], context=ctx, namespace=ns)
         status = await kubectl(["rollout", "status", f"deployment/{name}", "--timeout=10s"], context=ctx, namespace=ns)
@@ -234,6 +266,28 @@ async def handle_scale(args: dict) -> list[TextContent]:
     replicas = int(args["replicas"])
     ctx = args.get("context")
     ns = args.get("namespace")
+    check_namespace_writable(ns)
+
+    # Scale-to-zero confirmation gate
+    if replicas == 0 and not args.get("confirm_scale_to_zero"):
+        try:
+            resource = await kubectl_json(
+                ["get", f"{rtype}/{rname}"],
+                context=ctx,
+                namespace=ns,
+            )
+            current = resource.get("spec", {}).get("replicas", "unknown")
+        except KubectlError:
+            current = "unknown"
+        return [TextContent(
+            type="text",
+            text=(
+                f"WARNING: You are about to scale {rtype}/{rname} to 0 replicas "
+                f"(currently {current}). This will stop ALL pods for this workload.\n\n"
+                f"To confirm, re-call k8s_scale with confirm_scale_to_zero=true."
+            ),
+        )]
+
     try:
         out = await kubectl(
             ["scale", f"{rtype}/{rname}", f"--replicas={replicas}"],
@@ -250,6 +304,7 @@ async def handle_delete_pod(args: dict) -> list[TextContent]:
     ctx = args.get("context")
     ns = args.get("namespace")
     force = args.get("force", False)
+    check_namespace_writable(ns)
 
     cmd = ["delete", "pod", pod]
     if force:
@@ -267,6 +322,7 @@ async def handle_rollback_deployment(args: dict) -> list[TextContent]:
     ctx = args.get("context")
     ns = args.get("namespace")
     revision = args.get("revision")
+    check_namespace_writable(ns)
 
     cmd = ["rollout", "undo", f"deployment/{name}"]
     if revision is not None:
@@ -284,7 +340,34 @@ async def handle_apply_manifest(args: dict) -> list[TextContent]:
     ctx = args.get("context")
     ns = args.get("namespace")
     dry_run = args.get("dry_run", False)
+    check_namespace_writable(ns)
 
+    # --- YAML pre-validation and resource type blocklist ---
+    allow_cluster = os.environ.get("K8S_MCP_ALLOW_CLUSTER_RESOURCES", "").lower() == "true"
+    try:
+        docs = list(yaml.safe_load_all(manifest))
+    except yaml.YAMLError as e:
+        return _err(f"Invalid YAML manifest: {e}")
+
+    for doc in docs:
+        if doc is None:
+            continue
+        kind = doc.get("kind", "")
+
+        # Block cluster-scoped resource kinds unless overridden
+        if not allow_cluster and kind in _BLOCKED_KINDS:
+            return _err(
+                f"Resource kind '{kind}' is blocked by default. Blocked kinds: "
+                f"{sorted(_BLOCKED_KINDS)}. Set env var K8S_MCP_ALLOW_CLUSTER_RESOURCES=true "
+                f"to override."
+            )
+
+        # Check namespace from the document metadata
+        doc_ns = (doc.get("metadata") or {}).get("namespace")
+        if doc_ns:
+            check_namespace_writable(doc_ns)
+
+    # --- Apply ---
     cmd = ["apply", "-f", "-"]
     if dry_run:
         cmd += ["--dry-run=server"]
@@ -303,6 +386,7 @@ async def handle_patch_resource(args: dict) -> list[TextContent]:
     patch_type = args.get("patch_type", "merge")
     ctx = args.get("context")
     ns = args.get("namespace")
+    check_namespace_writable(ns)
 
     try:
         out = await kubectl(
@@ -335,8 +419,11 @@ async def handle_node_operation(args: dict) -> list[TextContent]:
     else:
         return _err(f"Unknown operation: {operation}. Must be cordon, uncordon, or drain.")
 
+    # Drain can take a long time — use a 5 minute timeout
+    timeout = 300 if operation == "drain" else None
+
     try:
-        out = await kubectl(cmd, context=ctx)
+        out = await kubectl(cmd, context=ctx, timeout_override=timeout)
     except KubectlError as e:
         return _err(str(e))
     return [TextContent(type="text", text=out)]
