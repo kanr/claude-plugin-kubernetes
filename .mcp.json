@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "kubernetes": {
+      "command": "/Users/admin/Development/claude-plugin-kubernetes/.venv/bin/python",
+      "args": ["-m", "src.server"],
+      "cwd": "/Users/admin/Development/claude-plugin-kubernetes"
+    }
+  }
+}
