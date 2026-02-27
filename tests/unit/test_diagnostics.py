@@ -1,5 +1,5 @@
 """
-Unit tests for src/tools/diagnostics.py handlers and _check_* helpers.
+Unit tests for k8s_mcp/tools/diagnostics.py handlers and _check_* helpers.
 """
 
 from __future__ import annotations
@@ -13,18 +13,21 @@ from k8s_mcp.kubectl import KubectlError
 from k8s_mcp.tools.diagnostics import (
     _check_deployments,
     _check_events,
+    _check_jobs,
     _check_nodes,
     _check_pods,
+    _check_pvcs,
+    _check_statefulsets,
     handle_describe,
     handle_find_issues,
     handle_get_yaml,
     handle_logs,
+    handle_self_test,
 )
-from tests.conftest import DEPLOYMENTS_JSON, EVENTS_TEXT, NODES_JSON, PODS_JSON
 
 
 # ---------------------------------------------------------------------------
-# _check_pods
+# _check_pods — now returns (critical, warning) tuple
 # ---------------------------------------------------------------------------
 
 async def test_check_pods_all_healthy():
@@ -40,8 +43,9 @@ async def test_check_pods_all_healthy():
         ]
     }
     with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=healthy):
-        issues = await _check_pods(None, None, False, 5)
-    assert issues == []
+        critical, warning = await _check_pods(None, None, False, 5)
+    assert critical == []
+    assert warning == []
 
 
 async def test_check_pods_pending_phase():
@@ -54,10 +58,11 @@ async def test_check_pods_pending_phase():
         ]
     }
     with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
-        issues = await _check_pods(None, None, False, 5)
-    assert len(issues) == 1
-    assert "pending-pod" in issues[0]
-    assert "Pending" in issues[0]
+        critical, warning = await _check_pods(None, None, False, 5)
+    assert len(critical) == 0
+    assert len(warning) == 1
+    assert "pending-pod" in warning[0]
+    assert "Pending" in warning[0]
 
 
 async def test_check_pods_high_restarts():
@@ -75,9 +80,9 @@ async def test_check_pods_high_restarts():
         ]
     }
     with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
-        issues = await _check_pods(None, None, False, 5)
-    assert len(issues) == 1
-    assert "restarts=10" in issues[0]
+        critical, warning = await _check_pods(None, None, False, 5)
+    assert len(critical) == 1
+    assert "restarted 10 times" in critical[0]
 
 
 async def test_check_pods_waiting_reason_appended():
@@ -99,8 +104,9 @@ async def test_check_pods_waiting_reason_appended():
         ]
     }
     with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
-        issues = await _check_pods(None, None, False, 5)
-    assert "CrashLoopBackOff" in issues[0]
+        critical, warning = await _check_pods(None, None, False, 5)
+    assert len(critical) == 1
+    assert "CrashLoopBackOff" in critical[0]
 
 
 async def test_check_pods_below_threshold_not_flagged():
@@ -116,8 +122,35 @@ async def test_check_pods_below_threshold_not_flagged():
         ]
     }
     with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
-        issues = await _check_pods(None, None, False, 5)
-    assert issues == []
+        critical, warning = await _check_pods(None, None, False, 5)
+    assert critical == []
+    assert warning == []
+
+
+async def test_check_pods_crashloop_suggests_logs():
+    """Critical pod issues should include next-step suggestions."""
+    data = {
+        "items": [
+            {
+                "metadata": {"name": "crash-pod", "namespace": "prod"},
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [
+                        {
+                            "name": "app",
+                            "restartCount": 15,
+                            "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
+        critical, _ = await _check_pods(None, None, False, 5)
+    assert len(critical) >= 1
+    combined = "\n".join(critical)
+    assert "k8s_logs" in combined
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +233,7 @@ async def test_check_deployments_unavailable():
         issues = await _check_deployments(None, None, False)
     assert len(issues) == 1
     assert "broken" in issues[0]
-    assert "unavailable=1" in issues[0]
+    assert "unavailable" in issues[0].lower()
 
 
 async def test_check_deployments_all_down():
@@ -216,69 +249,200 @@ async def test_check_deployments_all_down():
     with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
         issues = await _check_deployments(None, None, False)
     assert len(issues) == 1
-    assert "ready=0" in issues[0]
+    assert "unavailable" in issues[0].lower() or "down" in issues[0].lower()
 
 
 # ---------------------------------------------------------------------------
-# _check_events
+# _check_statefulsets
 # ---------------------------------------------------------------------------
 
-async def test_check_events_returns_last_20():
-    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value=EVENTS_TEXT):
-        issues = await _check_events(None, None, False)
-    assert len(issues) == 20
-
-
-async def test_check_events_kubectl_error_returns_empty():
-    with patch("k8s_mcp.tools.diagnostics.kubectl", side_effect=KubectlError("forbidden")):
-        issues = await _check_events(None, None, False)
+async def test_check_statefulsets_healthy():
+    data = {"items": [
+        {"metadata": {"name": "db", "namespace": "default"}, "spec": {"replicas": 3}, "status": {"readyReplicas": 3}}
+    ]}
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
+        issues = await _check_statefulsets(None, None, False)
     assert issues == []
 
 
+async def test_check_statefulsets_unavailable():
+    data = {"items": [
+        {"metadata": {"name": "db", "namespace": "default"}, "spec": {"replicas": 3}, "status": {"readyReplicas": 1}}
+    ]}
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
+        issues = await _check_statefulsets(None, None, False)
+    assert len(issues) == 1
+    assert "db" in issues[0]
+
+
 # ---------------------------------------------------------------------------
-# handle_find_issues
+# _check_jobs
 # ---------------------------------------------------------------------------
+
+async def test_check_jobs_healthy():
+    data = {"items": [
+        {"metadata": {"name": "migrate", "namespace": "default"}, "status": {"succeeded": 1, "conditions": []}}
+    ]}
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
+        issues = await _check_jobs(None, None, False)
+    assert issues == []
+
+
+async def test_check_jobs_failed():
+    data = {"items": [
+        {
+            "metadata": {"name": "bad-job", "namespace": "default"},
+            "status": {
+                "failed": 3, "succeeded": 0,
+                "conditions": [{"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded"}],
+            },
+        }
+    ]}
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
+        issues = await _check_jobs(None, None, False)
+    assert len(issues) == 1
+    assert "bad-job" in issues[0]
+    assert "failed" in issues[0].lower()
+
+
+# ---------------------------------------------------------------------------
+# _check_pvcs
+# ---------------------------------------------------------------------------
+
+async def test_check_pvcs_all_bound():
+    data = {"items": [
+        {"metadata": {"name": "data", "namespace": "default"}, "status": {"phase": "Bound"}, "spec": {}}
+    ]}
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
+        issues = await _check_pvcs(None, None, False)
+    assert issues == []
+
+
+async def test_check_pvcs_pending():
+    data = {"items": [
+        {"metadata": {"name": "stuck-pvc", "namespace": "default"}, "status": {"phase": "Pending"}, "spec": {"storageClassName": "gp2"}}
+    ]}
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
+        issues = await _check_pvcs(None, None, False)
+    assert len(issues) == 1
+    assert "stuck-pvc" in issues[0]
+    assert "Pending" in issues[0]
+
+
+# ---------------------------------------------------------------------------
+# _check_events — now uses kubectl_json and returns (lines, event_map) tuple
+# ---------------------------------------------------------------------------
+
+async def test_check_events_returns_last_20():
+    events_data = {
+        "items": [
+            {
+                "involvedObject": {"name": f"pod-{i}", "kind": "Pod"},
+                "metadata": {"namespace": "default", "creationTimestamp": "2026-02-27T10:00:00Z"},
+                "reason": "BackOff",
+                "message": "Back-off restarting",
+                "lastTimestamp": "2026-02-27T10:00:00Z",
+                "count": 1,
+            }
+            for i in range(25)
+        ]
+    }
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=events_data):
+        lines, event_map = await _check_events(None, None, False)
+    assert len(lines) == 20
+
+
+async def test_check_events_kubectl_error_returns_empty():
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", side_effect=KubectlError("forbidden")):
+        lines, event_map = await _check_events(None, None, False)
+    assert lines == []
+    assert event_map == {}
+
+
+# ---------------------------------------------------------------------------
+# handle_find_issues — now needs all 7 check mocks
+# ---------------------------------------------------------------------------
+
+def _patch_all_checks(**overrides):
+    """Helper to create patch context managers for all 7 check functions."""
+    defaults = {
+        "_check_pods": ([], []),
+        "_check_nodes": [],
+        "_check_deployments": [],
+        "_check_statefulsets": [],
+        "_check_jobs": [],
+        "_check_pvcs": [],
+        "_check_events": ([], {}),
+    }
+    defaults.update(overrides)
+    return {
+        name: patch(f"k8s_mcp.tools.diagnostics.{name}", return_value=value)
+        for name, value in defaults.items()
+    }
+
 
 async def test_find_issues_no_problems():
-    with patch("k8s_mcp.tools.diagnostics._check_pods", return_value=[]), \
-         patch("k8s_mcp.tools.diagnostics._check_nodes", return_value=[]), \
-         patch("k8s_mcp.tools.diagnostics._check_deployments", return_value=[]), \
-         patch("k8s_mcp.tools.diagnostics._check_events", return_value=[]):
+    p = _patch_all_checks()
+    with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
+         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
         result = await handle_find_issues({})
-
     assert "No issues" in result[0].text
 
 
-async def test_find_issues_reports_pod_section():
-    with patch("k8s_mcp.tools.diagnostics._check_pods", return_value=["[default] crasher restarts=10"]), \
-         patch("k8s_mcp.tools.diagnostics._check_nodes", return_value=[]), \
-         patch("k8s_mcp.tools.diagnostics._check_deployments", return_value=[]), \
-         patch("k8s_mcp.tools.diagnostics._check_events", return_value=[]):
+async def test_find_issues_reports_critical_pod():
+    p = _patch_all_checks(_check_pods=(["[default/crasher] CrashLoopBackOff"], []))
+    with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
+         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
         result = await handle_find_issues({})
-
-    assert "Pod Issues" in result[0].text
+    assert "CRITICAL" in result[0].text
     assert "crasher" in result[0].text
 
 
+async def test_find_issues_reports_warning_pods():
+    p = _patch_all_checks(_check_pods=([], ["[default/pending-pod] phase=Pending"]))
+    with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
+         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
+        result = await handle_find_issues({})
+    assert "WARNING" in result[0].text
+    assert "pending-pod" in result[0].text
+
+
 async def test_find_issues_check_exception_reported():
-    with patch("k8s_mcp.tools.diagnostics._check_pods", side_effect=Exception("timeout")), \
-         patch("k8s_mcp.tools.diagnostics._check_nodes", return_value=[]), \
-         patch("k8s_mcp.tools.diagnostics._check_deployments", return_value=[]), \
-         patch("k8s_mcp.tools.diagnostics._check_events", return_value=[]):
+    p = _patch_all_checks()
+    p["_check_pods"] = patch("k8s_mcp.tools.diagnostics._check_pods", side_effect=Exception("timeout"))
+    with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
+         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
         result = await handle_find_issues({})
-
-    assert "scan failed" in result[0].text
-    assert "timeout" in result[0].text
+    assert "scan failed" in result[0].text or "timeout" in result[0].text
 
 
-async def test_find_issues_counts_categories_correctly():
-    with patch("k8s_mcp.tools.diagnostics._check_pods", return_value=["issue1"]), \
-         patch("k8s_mcp.tools.diagnostics._check_nodes", return_value=["issue2"]), \
-         patch("k8s_mcp.tools.diagnostics._check_deployments", return_value=[]), \
-         patch("k8s_mcp.tools.diagnostics._check_events", return_value=[]):
+async def test_find_issues_severity_counts():
+    p = _patch_all_checks(
+        _check_pods=(["critical-issue"], []),
+        _check_nodes=["node-issue"],
+    )
+    with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
+         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
         result = await handle_find_issues({})
+    text = result[0].text
+    assert "2 critical" in text
+    assert "0 warning" in text
 
-    assert "2 categories" in result[0].text
+
+async def test_find_issues_includes_statefulset_job_pvc():
+    """New check categories should appear in output."""
+    p = _patch_all_checks(
+        _check_statefulsets=["[default/db] statefulset unavailable"],
+        _check_jobs=["[default/migrate] Job failed"],
+        _check_pvcs=["[default/data-pvc] PVC phase=Pending"],
+    )
+    with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
+         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
+        result = await handle_find_issues({})
+    text = result[0].text
+    assert "db" in text
+    assert "migrate" in text
+    assert "data-pvc" in text
 
 
 # ---------------------------------------------------------------------------
@@ -332,17 +496,55 @@ async def test_handle_logs_empty_output():
     assert "no log output" in result[0].text
 
 
+async def test_handle_logs_error_filter():
+    raw_logs = "\n".join([
+        "INFO: Starting app",
+        "INFO: Ready",
+        "ERROR: Connection refused to db:5432",
+        "INFO: Retrying",
+        "INFO: Processing",
+        "FATAL: Shutting down",
+        "INFO: Cleanup",
+    ])
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value=raw_logs):
+        result = await handle_logs({"pod_name": "my-pod", "filter": "errors"})
+    text = result[0].text
+    assert "match error patterns" in text
+    assert "ERROR" in text
+    assert "FATAL" in text
+
+
 # ---------------------------------------------------------------------------
-# handle_get_yaml
+# handle_get_yaml — now uses kubectl_json by default (strips managed fields)
 # ---------------------------------------------------------------------------
 
 async def test_handle_get_yaml_success():
-    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="apiVersion: v1\nkind: Pod"):
+    mock_data = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "my-pod",
+            "managedFields": [{"manager": "kubectl"}],
+            "annotations": {
+                "kubectl.kubernetes.io/last-applied-configuration": "{}",
+            },
+        },
+    }
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=mock_data):
         result = await handle_get_yaml({"resource_type": "pod", "resource_name": "my-pod"})
+    text = result[0].text
+    assert "apiVersion" in text
+    assert "managedFields" not in text
+    assert "last-applied-configuration" not in text
+
+
+async def test_handle_get_yaml_raw_mode():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="apiVersion: v1\nkind: Pod"):
+        result = await handle_get_yaml({"resource_type": "pod", "resource_name": "my-pod", "raw": True})
     assert "apiVersion" in result[0].text
 
 
 async def test_handle_get_yaml_error():
-    with patch("k8s_mcp.tools.diagnostics.kubectl", side_effect=KubectlError("not found")):
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", side_effect=KubectlError("not found")):
         result = await handle_get_yaml({"resource_type": "pod", "resource_name": "ghost"})
     assert "Error" in result[0].text

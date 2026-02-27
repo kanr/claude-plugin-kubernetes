@@ -75,11 +75,24 @@ async def test_scale_statefulset():
     assert "statefulset/db" in cmd
 
 
-async def test_scale_to_zero():
+async def test_scale_to_zero_requires_confirmation():
+    """Scaling to 0 without confirm_scale_to_zero returns a warning."""
+    with patch("k8s_mcp.tools.remediation.kubectl_json", return_value={"spec": {"replicas": 3}}):
+        result = await handle_scale({"resource_type": "deployment", "resource_name": "app", "replicas": 0})
+    assert "WARNING" in result[0].text
+    assert "confirm_scale_to_zero" in result[0].text
+
+
+async def test_scale_to_zero_confirmed():
+    """Scaling to 0 with confirm_scale_to_zero=true proceeds normally."""
     with patch("k8s_mcp.tools.remediation.kubectl", return_value="scaled") as mock_kctl:
-        await handle_scale({"resource_type": "deployment", "resource_name": "app", "replicas": 0})
+        result = await handle_scale({
+            "resource_type": "deployment", "resource_name": "app",
+            "replicas": 0, "confirm_scale_to_zero": True,
+        })
     cmd = mock_kctl.call_args[0][0]
     assert "--replicas=0" in cmd
+    assert result[0].text == "scaled"
 
 
 # ---------------------------------------------------------------------------

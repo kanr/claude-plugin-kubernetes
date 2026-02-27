@@ -27,13 +27,17 @@ from datetime import datetime, timezone
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
+    AnyUrl,
     CallToolResult,
     GetPromptResult,
     ListToolsResult,
+    ReadResourceResult,
     TextContent,
+    TextResourceContents,
 )
 
 from k8s_mcp.prompts import ALL_PROMPTS, get_prompt
+from k8s_mcp.resources import RESOURCE_TEMPLATES, STATIC_RESOURCES, read_resource
 from k8s_mcp.tools.awareness import AWARENESS_HANDLERS, AWARENESS_TOOLS
 from k8s_mcp.tools.diagnostics import DIAGNOSTIC_HANDLERS, DIAGNOSTIC_TOOLS
 from k8s_mcp.tools.remediation import REMEDIATION_HANDLERS, REMEDIATION_TOOLS
@@ -96,6 +100,26 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             content=[TextContent(type="text", text=f"Unexpected error: {exc}")],
             isError=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+
+
+@server.list_resources()
+async def list_resources() -> list:
+    return STATIC_RESOURCES
+
+
+@server.list_resource_templates()
+async def list_resource_templates() -> list:
+    return RESOURCE_TEMPLATES
+
+
+@server.read_resource()
+async def handle_read_resource(uri: AnyUrl) -> str:
+    return await read_resource(str(uri))
 
 
 # ---------------------------------------------------------------------------
