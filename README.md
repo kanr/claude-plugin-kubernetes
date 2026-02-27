@@ -39,25 +39,36 @@ An MCP server that gives Claude deep Kubernetes cluster awareness, diagnostics, 
 
 ## Setup
 
-### 1. Install dependencies
+### Claude Desktop
+
+Add the following to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "kubernetes": {
+      "command": "uvx",
+      "args": ["--from", "claude-plugin-kubernetes", "k8s-mcp"]
+    }
+  }
+}
+```
+
+Requires [`uv`](https://docs.astral.sh/uv/getting-started/installation/) to be installed.
+
+### Claude Code (CLI)
+
+The `.mcp.json` in this repo is already configured. Clone the repo and open it in Claude Code — the server registers automatically.
+
+To verify, run `/mcp` inside Claude Code. You should see `kubernetes` listed with 21 tools.
+
+### Local development
 
 ```bash
-cd /Users/admin/Development/claude-plugin-kubernetes
-python3 -m venv .venv
-.venv/bin/pip install -e .
+git clone https://github.com/kanr/claude-plugin-kubernetes
+cd claude-plugin-kubernetes
+python3 -m venv .venv && .venv/bin/pip install -e .
 ```
-
-### 2. Register with Claude Code
-
-The `.mcp.json` file in this directory is automatically picked up by Claude Code when you open this project. Alternatively, copy its contents into `~/.claude/mcp.json`.
-
-### 3. Verify connection
-
-Inside Claude Code, run:
-```
-/mcp
-```
-You should see `kubernetes` listed as a connected server with 21 tools.
 
 ## Requirements
 

@@ -23,9 +23,9 @@ from mcp.types import (
     TextContent,
 )
 
-from src.tools.awareness import AWARENESS_HANDLERS, AWARENESS_TOOLS
-from src.tools.diagnostics import DIAGNOSTIC_HANDLERS, DIAGNOSTIC_TOOLS
-from src.tools.remediation import REMEDIATION_HANDLERS, REMEDIATION_TOOLS
+from k8s_mcp.tools.awareness import AWARENESS_HANDLERS, AWARENESS_TOOLS
+from k8s_mcp.tools.diagnostics import DIAGNOSTIC_HANDLERS, DIAGNOSTIC_TOOLS
+from k8s_mcp.tools.remediation import REMEDIATION_HANDLERS, REMEDIATION_TOOLS
 
 # ---------------------------------------------------------------------------
 # Server setup

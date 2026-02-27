@@ -17,8 +17,8 @@ import json
 
 from mcp.types import TextContent, Tool
 
-from src.kubectl import KubectlError, kubectl, kubectl_json
-from src.formatters import node_conditions_summary, severity_icon
+from k8s_mcp.kubectl import KubectlError, kubectl, kubectl_json
+from k8s_mcp.formatters import node_conditions_summary, severity_icon
 
 
 # ---------------------------------------------------------------------------

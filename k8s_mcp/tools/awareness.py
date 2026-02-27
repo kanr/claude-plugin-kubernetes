@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from mcp.types import TextContent, Tool
 
-from src.kubectl import KubectlError, kubectl
+from k8s_mcp.kubectl import KubectlError, kubectl
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +241,7 @@ async def handle_list_services(args: dict) -> list[TextContent]:
 async def handle_list_events(args: dict) -> list[TextContent]:
     ctx = args.get("context")
     ns = args.get("namespace")
-    all_ns = args.get("all_namespaces", True)
+    all_ns = args.get("all_namespaces", False)
     warnings_only = args.get("warnings_only", False)
 
     cmd = ["get", "events", "--sort-by=.lastTimestamp"]

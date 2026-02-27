@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from mcp.types import TextContent, Tool
 
-from src.kubectl import KubectlError, kubectl, kubectl_stdin
+from k8s_mcp.kubectl import KubectlError, kubectl, kubectl_stdin
 
 
 # ---------------------------------------------------------------------------
