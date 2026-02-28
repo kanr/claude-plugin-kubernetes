@@ -13,15 +13,12 @@ Tools:
   k8s_apply_manifest      — apply YAML via stdin (medium risk)
   k8s_patch_resource      — JSON merge patch (medium risk)
   k8s_node_operation      — cordon / uncordon / drain (high risk for drain)
-  k8s_rollout_status      — check rollout status (read-only)
-  k8s_rollout_history     — view rollout history (read-only)
   k8s_delete_resource     — generic resource deletion (medium risk)
   k8s_diff                — diff manifest against live state (read-only)
 """
 
 from __future__ import annotations
 
-import asyncio
 import os
 
 import yaml
@@ -29,13 +26,11 @@ from mcp.types import TextContent, Tool, ToolAnnotations
 
 from k8s_mcp.kubectl import (
     KubectlError,
-    _build_args,
-    _get_semaphore,
     check_namespace_writable,
     kubectl,
+    kubectl_diff,
     kubectl_json,
     kubectl_stdin,
-    KUBECTL_TIMEOUT,
 )
 
 # ---------------------------------------------------------------------------
@@ -249,40 +244,6 @@ REMEDIATION_TOOLS: list[Tool] = [
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
     ),
     # --- New tools ---
-    Tool(
-        name="k8s_rollout_status",
-        description=(
-            "Check the rollout status of a deployment. Returns current rollout progress "
-            "and whether the rollout completed successfully. Times out after 30 seconds."
-        ),
-        inputSchema={
-            "type": "object",
-            "required": ["deployment_name"],
-            "properties": {
-                "deployment_name": {"type": "string", "description": "Name of the deployment."},
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
-            },
-        },
-        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True),
-    ),
-    Tool(
-        name="k8s_rollout_history",
-        description=(
-            "View the rollout history of a deployment, showing all recorded revisions. "
-            "Useful for deciding which revision to roll back to."
-        ),
-        inputSchema={
-            "type": "object",
-            "required": ["deployment_name"],
-            "properties": {
-                "deployment_name": {"type": "string", "description": "Name of the deployment."},
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
-            },
-        },
-        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True),
-    ),
     Tool(
         name="k8s_delete_resource",
         description=(
@@ -512,36 +473,6 @@ async def handle_node_operation(args: dict) -> list[TextContent]:
     return [TextContent(type="text", text=out)]
 
 
-async def handle_rollout_status(args: dict) -> list[TextContent]:
-    name = args["deployment_name"]
-    ctx = args.get("context")
-    ns = args.get("namespace")
-    try:
-        out = await kubectl(
-            ["rollout", "status", f"deployment/{name}", "--timeout=30s"],
-            context=ctx,
-            namespace=ns,
-        )
-    except KubectlError as e:
-        return _err(str(e))
-    return [TextContent(type="text", text=out)]
-
-
-async def handle_rollout_history(args: dict) -> list[TextContent]:
-    name = args["deployment_name"]
-    ctx = args.get("context")
-    ns = args.get("namespace")
-    try:
-        out = await kubectl(
-            ["rollout", "history", f"deployment/{name}"],
-            context=ctx,
-            namespace=ns,
-        )
-    except KubectlError as e:
-        return _err(str(e))
-    return [TextContent(type="text", text=out)]
-
-
 async def handle_delete_resource(args: dict) -> list[TextContent]:
     rtype = args["resource_type"]
     rname = args["resource_name"]
@@ -566,37 +497,21 @@ async def handle_diff(args: dict) -> list[TextContent]:
     ctx = args.get("context")
     ns = args.get("namespace")
 
-    full_args = _build_args(["diff", "-f", "-"], context=ctx, namespace=ns)
-
-    async with _get_semaphore():
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl",
-            *full_args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    try:
+        returncode, stdout_text, stderr_text = await kubectl_diff(
+            manifest, context=ctx, namespace=ns
         )
+    except KubectlError as e:
+        return _err(str(e))
 
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=manifest.encode()),
-                timeout=KUBECTL_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            return _err(f"kubectl diff timed out after {KUBECTL_TIMEOUT}s")
-
-    stdout_text = stdout.decode(errors="replace").strip()
-    stderr_text = stderr.decode(errors="replace").strip()
-
-    if proc.returncode == 0:
+    if returncode == 0:
         return [TextContent(type="text", text="No differences found. Live state matches the manifest.")]
-    elif proc.returncode == 1:
+    elif returncode == 1:
         # Exit code 1 means there IS a diff — stdout contains the unified diff
         return [TextContent(type="text", text=stdout_text if stdout_text else "Diff detected but output was empty.")]
     else:
         # Exit code >1 is an actual error
-        return _err(stderr_text if stderr_text else f"kubectl diff exited with code {proc.returncode}")
+        return _err(stderr_text if stderr_text else f"kubectl diff exited with code {returncode}")
 
 
 # ---------------------------------------------------------------------------
@@ -611,8 +526,6 @@ REMEDIATION_HANDLERS = {
     "k8s_apply_manifest": handle_apply_manifest,
     "k8s_patch_resource": handle_patch_resource,
     "k8s_node_operation": handle_node_operation,
-    "k8s_rollout_status": handle_rollout_status,
-    "k8s_rollout_history": handle_rollout_history,
     "k8s_delete_resource": handle_delete_resource,
     "k8s_diff": handle_diff,
 }

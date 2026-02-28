@@ -11,6 +11,7 @@ from mcp.types import TextContent
 
 from k8s_mcp.kubectl import KubectlError
 from k8s_mcp.tools.diagnostics import (
+    _check_daemonsets,
     _check_deployments,
     _check_events,
     _check_jobs,
@@ -19,9 +20,13 @@ from k8s_mcp.tools.diagnostics import (
     _check_pvcs,
     _check_statefulsets,
     handle_describe,
+    handle_exec,
     handle_find_issues,
     handle_get_yaml,
     handle_logs,
+    handle_logs_selector,
+    handle_rollout_history,
+    handle_rollout_status,
     handle_self_test,
 )
 
@@ -360,16 +365,17 @@ async def test_check_events_kubectl_error_returns_empty():
 
 
 # ---------------------------------------------------------------------------
-# handle_find_issues — now needs all 7 check mocks
+# handle_find_issues — now needs all 8 check mocks
 # ---------------------------------------------------------------------------
 
 def _patch_all_checks(**overrides):
-    """Helper to create patch context managers for all 7 check functions."""
+    """Helper to create patch context managers for all 8 check functions."""
     defaults = {
         "_check_pods": ([], []),
         "_check_nodes": [],
         "_check_deployments": [],
         "_check_statefulsets": [],
+        "_check_daemonsets": [],
         "_check_jobs": [],
         "_check_pvcs": [],
         "_check_events": ([], {}),
@@ -384,7 +390,8 @@ def _patch_all_checks(**overrides):
 async def test_find_issues_no_problems():
     p = _patch_all_checks()
     with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
-         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
+         p["_check_statefulsets"], p["_check_daemonsets"], p["_check_jobs"], \
+         p["_check_pvcs"], p["_check_events"]:
         result = await handle_find_issues({})
     assert "No issues" in result[0].text
 
@@ -392,7 +399,8 @@ async def test_find_issues_no_problems():
 async def test_find_issues_reports_critical_pod():
     p = _patch_all_checks(_check_pods=(["[default/crasher] CrashLoopBackOff"], []))
     with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
-         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
+         p["_check_statefulsets"], p["_check_daemonsets"], p["_check_jobs"], \
+         p["_check_pvcs"], p["_check_events"]:
         result = await handle_find_issues({})
     assert "CRITICAL" in result[0].text
     assert "crasher" in result[0].text
@@ -401,7 +409,8 @@ async def test_find_issues_reports_critical_pod():
 async def test_find_issues_reports_warning_pods():
     p = _patch_all_checks(_check_pods=([], ["[default/pending-pod] phase=Pending"]))
     with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
-         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
+         p["_check_statefulsets"], p["_check_daemonsets"], p["_check_jobs"], \
+         p["_check_pvcs"], p["_check_events"]:
         result = await handle_find_issues({})
     assert "WARNING" in result[0].text
     assert "pending-pod" in result[0].text
@@ -411,7 +420,8 @@ async def test_find_issues_check_exception_reported():
     p = _patch_all_checks()
     p["_check_pods"] = patch("k8s_mcp.tools.diagnostics._check_pods", side_effect=Exception("timeout"))
     with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
-         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
+         p["_check_statefulsets"], p["_check_daemonsets"], p["_check_jobs"], \
+         p["_check_pvcs"], p["_check_events"]:
         result = await handle_find_issues({})
     assert "scan failed" in result[0].text or "timeout" in result[0].text
 
@@ -422,7 +432,8 @@ async def test_find_issues_severity_counts():
         _check_nodes=["node-issue"],
     )
     with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
-         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
+         p["_check_statefulsets"], p["_check_daemonsets"], p["_check_jobs"], \
+         p["_check_pvcs"], p["_check_events"]:
         result = await handle_find_issues({})
     text = result[0].text
     assert "2 critical" in text
@@ -437,7 +448,8 @@ async def test_find_issues_includes_statefulset_job_pvc():
         _check_pvcs=["[default/data-pvc] PVC phase=Pending"],
     )
     with p["_check_pods"], p["_check_nodes"], p["_check_deployments"], \
-         p["_check_statefulsets"], p["_check_jobs"], p["_check_pvcs"], p["_check_events"]:
+         p["_check_statefulsets"], p["_check_daemonsets"], p["_check_jobs"], \
+         p["_check_pvcs"], p["_check_events"]:
         result = await handle_find_issues({})
     text = result[0].text
     assert "db" in text
@@ -548,3 +560,221 @@ async def test_handle_get_yaml_error():
     with patch("k8s_mcp.tools.diagnostics.kubectl_json", side_effect=KubectlError("not found")):
         result = await handle_get_yaml({"resource_type": "pod", "resource_name": "ghost"})
     assert "Error" in result[0].text
+
+
+# ---------------------------------------------------------------------------
+# _check_daemonsets
+# ---------------------------------------------------------------------------
+
+
+async def test_check_daemonsets_no_issues():
+    data = {
+        "items": [
+            {
+                "metadata": {"namespace": "kube-system", "name": "fluentd"},
+                "status": {"desiredNumberScheduled": 3, "numberReady": 3},
+            }
+        ]
+    }
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
+        issues = await _check_daemonsets(None, None, True)
+    assert issues == []
+
+
+async def test_check_daemonsets_not_ready():
+    data = {
+        "items": [
+            {
+                "metadata": {"namespace": "kube-system", "name": "fluentd"},
+                "status": {"desiredNumberScheduled": 3, "numberReady": 1},
+            }
+        ]
+    }
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
+        issues = await _check_daemonsets(None, None, True)
+    assert len(issues) == 1
+    assert "fluentd" in issues[0]
+    assert "2/3" in issues[0]
+
+
+async def test_check_daemonsets_none_ready():
+    data = {
+        "items": [
+            {
+                "metadata": {"namespace": "default", "name": "node-exporter"},
+                "status": {"desiredNumberScheduled": 2, "numberReady": None},
+            }
+        ]
+    }
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value=data):
+        issues = await _check_daemonsets(None, None, True)
+    assert len(issues) == 1
+    assert "2/2" in issues[0]
+
+
+async def test_check_daemonsets_empty():
+    with patch("k8s_mcp.tools.diagnostics.kubectl_json", return_value={"items": []}):
+        issues = await _check_daemonsets(None, None, True)
+    assert issues == []
+
+
+# ---------------------------------------------------------------------------
+# handle_exec
+# ---------------------------------------------------------------------------
+
+
+async def test_handle_exec_success():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="uid=0(root)") as m:
+        result = await handle_exec({"pod_name": "my-pod", "command": "id"})
+    text = result[0].text
+    assert "uid=0" in text
+    called_args = m.call_args
+    cmd = called_args[0][0]
+    assert cmd[0] == "exec"
+    assert "my-pod" in cmd
+    assert "--" in cmd
+    assert "id" in cmd
+
+
+async def test_handle_exec_with_container():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="ok") as m:
+        await handle_exec({"pod_name": "my-pod", "command": "ls", "container": "sidecar"})
+    cmd = m.call_args[0][0]
+    assert "-c" in cmd
+    assert "sidecar" in cmd
+
+
+async def test_handle_exec_no_output():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value=""):
+        result = await handle_exec({"pod_name": "my-pod", "command": "true"})
+    assert "no output" in result[0].text
+
+
+async def test_handle_exec_error():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", side_effect=KubectlError("container not found")):
+        result = await handle_exec({"pod_name": "my-pod", "command": "id"})
+    assert "Error" in result[0].text
+    assert "container not found" in result[0].text
+
+
+async def test_handle_exec_passes_context_and_namespace():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="ok") as m:
+        await handle_exec({"pod_name": "p", "command": "ls", "context": "prod", "namespace": "app"})
+    kwargs = m.call_args[1]
+    assert kwargs["context"] == "prod"
+    assert kwargs["namespace"] == "app"
+
+
+# ---------------------------------------------------------------------------
+# handle_logs_selector
+# ---------------------------------------------------------------------------
+
+
+async def test_handle_logs_selector_success():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="log line 1\nlog line 2") as m:
+        result = await handle_logs_selector({"label_selector": "app=web"})
+    text = result[0].text
+    assert "log line" in text
+    cmd = m.call_args[0][0]
+    assert "logs" in cmd
+    assert "-l" in cmd
+    assert "app=web" in cmd
+    assert "--prefix=true" in cmd
+
+
+async def test_handle_logs_selector_default_tail():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="x") as m:
+        await handle_logs_selector({"label_selector": "app=api"})
+    cmd = m.call_args[0][0]
+    assert "--tail=50" in cmd
+
+
+async def test_handle_logs_selector_custom_tail():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="x") as m:
+        await handle_logs_selector({"label_selector": "app=api", "tail": 100})
+    cmd = m.call_args[0][0]
+    assert "--tail=100" in cmd
+
+
+async def test_handle_logs_selector_with_since():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="x") as m:
+        await handle_logs_selector({"label_selector": "app=api", "since": "1h"})
+    cmd = m.call_args[0][0]
+    assert "--since=1h" in cmd
+
+
+async def test_handle_logs_selector_with_container():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="x") as m:
+        await handle_logs_selector({"label_selector": "app=api", "container": "proxy"})
+    cmd = m.call_args[0][0]
+    assert "-c" in cmd
+    assert "proxy" in cmd
+
+
+async def test_handle_logs_selector_no_output():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value=""):
+        result = await handle_logs_selector({"label_selector": "app=idle"})
+    assert "no log output" in result[0].text
+
+
+async def test_handle_logs_selector_error():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", side_effect=KubectlError("selector invalid")):
+        result = await handle_logs_selector({"label_selector": "bad=selector"})
+    assert "Error" in result[0].text
+
+
+# ---------------------------------------------------------------------------
+# handle_rollout_status
+# ---------------------------------------------------------------------------
+
+
+async def test_handle_rollout_status_success():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="deployment successfully rolled out") as m:
+        result = await handle_rollout_status({"deployment_name": "my-app"})
+    assert "successfully rolled out" in result[0].text
+    cmd = m.call_args[0][0]
+    assert cmd == ["rollout", "status", "deployment/my-app", "--timeout=30s"]
+
+
+async def test_handle_rollout_status_passes_context_namespace():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="ok") as m:
+        await handle_rollout_status({"deployment_name": "api", "context": "staging", "namespace": "backend"})
+    kwargs = m.call_args[1]
+    assert kwargs["context"] == "staging"
+    assert kwargs["namespace"] == "backend"
+
+
+async def test_handle_rollout_status_error():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", side_effect=KubectlError("timed out")):
+        result = await handle_rollout_status({"deployment_name": "broken"})
+    assert "Error" in result[0].text
+    assert "timed out" in result[0].text
+
+
+# ---------------------------------------------------------------------------
+# handle_rollout_history
+# ---------------------------------------------------------------------------
+
+
+async def test_handle_rollout_history_success():
+    history = "REVISION  CHANGE-CAUSE\n1         <none>\n2         bump image"
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value=history) as m:
+        result = await handle_rollout_history({"deployment_name": "my-app"})
+    assert "REVISION" in result[0].text
+    cmd = m.call_args[0][0]
+    assert cmd == ["rollout", "history", "deployment/my-app"]
+
+
+async def test_handle_rollout_history_passes_context_namespace():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", return_value="x") as m:
+        await handle_rollout_history({"deployment_name": "svc", "context": "prod", "namespace": "ns"})
+    kwargs = m.call_args[1]
+    assert kwargs["context"] == "prod"
+    assert kwargs["namespace"] == "ns"
+
+
+async def test_handle_rollout_history_error():
+    with patch("k8s_mcp.tools.diagnostics.kubectl", side_effect=KubectlError("not found")):
+        result = await handle_rollout_history({"deployment_name": "ghost"})
+    assert "Error" in result[0].text
+

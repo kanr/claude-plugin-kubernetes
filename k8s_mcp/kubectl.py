@@ -250,3 +250,45 @@ async def kubectl_stdin(
     if err_out:
         return f"{out}\n{err_out}".strip()
     return out
+
+
+async def kubectl_diff(
+    stdin_data: str,
+    *,
+    context: str | None = None,
+    namespace: str | None = None,
+) -> tuple[int, str, str]:
+    """Run ``kubectl diff -f -`` and return (returncode, stdout, stderr).
+
+    Exit code semantics differ from other kubectl commands:
+      0 — no diff; live state matches the manifest
+      1 — diff exists; stdout contains the unified diff
+      >1 — actual error (e.g. server-side validation failure)
+
+    Raises KubectlError only on timeout.
+    """
+    full_args = _build_args(["diff", "-f", "-"], context=context, namespace=namespace)
+
+    async with _get_semaphore():
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl",
+            *full_args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=stdin_data.encode()),
+                timeout=KUBECTL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise KubectlError(f"kubectl diff timed out after {KUBECTL_TIMEOUT}s")
+
+    return (
+        proc.returncode,
+        stdout.decode(errors="replace").strip(),
+        stderr.decode(errors="replace").strip(),
+    )

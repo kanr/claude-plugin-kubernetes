@@ -53,7 +53,11 @@ async def test_handle_cluster_info_error():
     with patch("k8s_mcp.tools.awareness.kubectl", side_effect=KubectlError("connection refused")):
         result = await handle_cluster_info({})
 
-    assert "Error" in result[0].text
+    # With return_exceptions=True, errors degrade gracefully rather than hard-failing.
+    # Each section reports "(unavailable — ...)" when its kubectl call fails.
+    assert len(result) == 1
+    assert "unavailable" in result[0].text
+    assert "connection refused" in result[0].text
 
 
 async def test_handle_cluster_info_passes_context():
@@ -173,10 +177,17 @@ async def test_handle_list_services_success():
 # ---------------------------------------------------------------------------
 
 async def test_handle_list_events_defaults_all_namespaces_false():
-    """Regression: calling with a namespace should NOT set all_namespaces=True."""
+    """When a namespace is explicitly specified, all_namespaces should be False."""
     with patch("k8s_mcp.tools.awareness.kubectl", return_value="events output") as mock_kctl:
         await handle_list_events({"namespace": "default"})
     assert mock_kctl.call_args.kwargs.get("all_namespaces") is False
+
+
+async def test_handle_list_events_defaults_all_namespaces_true_when_no_ns():
+    """When no namespace is specified, all_namespaces defaults to True (cluster-wide view)."""
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value="events output") as mock_kctl:
+        await handle_list_events({})
+    assert mock_kctl.call_args.kwargs.get("all_namespaces") is True
 
 
 async def test_handle_list_events_explicit_all_namespaces():
@@ -250,7 +261,123 @@ async def test_handle_list_images_passes_context():
 
 
 async def test_handle_list_images_error():
-    with patch("k8s_mcp.tools.awareness.kubectl", side_effect=KubectlError("forbidden")):
+    with patch("k8s_mcp.tools.awareness.kubectl", side_effect=KubectlError("no images")):
         result = await handle_list_images({})
     assert "Error" in result[0].text
-    assert "forbidden" in result[0].text
+
+
+# ---------------------------------------------------------------------------
+# _simple_list based handlers — parametrized coverage
+# ---------------------------------------------------------------------------
+
+from k8s_mcp.tools.awareness import (
+    handle_list_statefulsets,
+    handle_list_ingresses,
+    handle_list_jobs,
+    handle_list_cronjobs,
+    handle_list_configmaps,
+    handle_list_secrets,
+    handle_list_pvcs,
+    handle_list_daemonsets,
+    handle_list_hpa,
+    handle_list_networkpolicies,
+    handle_api_resources,
+    handle_list_serviceaccounts,
+    handle_list_roles,
+    handle_list_rolebindings,
+    handle_list_pvs,
+    handle_list_storageclasses,
+    handle_list_resourcequotas,
+    handle_list_limitranges,
+    handle_list_poddisruptionbudgets,
+)
+
+_SIMPLE_LIST_NS_HANDLERS = [
+    handle_list_statefulsets,
+    handle_list_ingresses,
+    handle_list_jobs,
+    handle_list_cronjobs,
+    handle_list_configmaps,
+    handle_list_secrets,
+    handle_list_pvcs,
+    handle_list_daemonsets,
+    handle_list_hpa,
+    handle_list_networkpolicies,
+    handle_list_serviceaccounts,
+    handle_list_roles,
+    handle_list_rolebindings,
+    handle_list_resourcequotas,
+    handle_list_limitranges,
+    handle_list_poddisruptionbudgets,
+]
+
+
+@pytest.mark.parametrize("handler", _SIMPLE_LIST_NS_HANDLERS, ids=lambda h: h.__name__)
+async def test_simple_list_ns_success(handler):
+    """All _simple_list-backed handlers should return kubectl output on success."""
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value="resource-output"):
+        result = await handler({})
+    assert len(result) == 1
+    assert result[0].text == "resource-output"
+
+
+@pytest.mark.parametrize("handler", _SIMPLE_LIST_NS_HANDLERS, ids=lambda h: h.__name__)
+async def test_simple_list_ns_error(handler):
+    """All _simple_list-backed handlers should surface errors."""
+    with patch("k8s_mcp.tools.awareness.kubectl", side_effect=KubectlError("not found")):
+        result = await handler({})
+    assert "Error" in result[0].text
+
+
+@pytest.mark.parametrize("handler", _SIMPLE_LIST_NS_HANDLERS, ids=lambda h: h.__name__)
+async def test_simple_list_ns_passes_namespace(handler):
+    """All namespaced handlers must forward namespace and all_namespaces kwargs."""
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value="out") as mock_kctl:
+        await handler({"namespace": "staging", "all_namespaces": False})
+    assert mock_kctl.call_args.kwargs["namespace"] == "staging"
+    assert mock_kctl.call_args.kwargs["all_namespaces"] is False
+
+
+# ---------------------------------------------------------------------------
+# Cluster-scoped handlers (pvs, storageclasses) — no namespace parameter
+# ---------------------------------------------------------------------------
+
+async def test_handle_list_pvs_success():
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value="pv-output") as mock_kctl:
+        result = await handle_list_pvs({"context": "prod"})
+    cmd = mock_kctl.call_args[0][0]
+    assert "get" in cmd
+    assert "pv" in cmd
+    assert result[0].text == "pv-output"
+
+
+async def test_handle_list_pvs_error():
+    with patch("k8s_mcp.tools.awareness.kubectl", side_effect=KubectlError("forbidden")):
+        result = await handle_list_pvs({})
+    assert "Error" in result[0].text
+
+
+async def test_handle_list_storageclasses_success():
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value="sc-output") as mock_kctl:
+        result = await handle_list_storageclasses({})
+    cmd = mock_kctl.call_args[0][0]
+    assert "storageclasses" in cmd
+    assert result[0].text == "sc-output"
+
+
+async def test_handle_api_resources_success():
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value="api-res") as mock_kctl:
+        result = await handle_api_resources({"context": "ctx"})
+    cmd = mock_kctl.call_args[0][0]
+    assert "api-resources" in cmd
+    assert mock_kctl.call_args.kwargs["context"] == "ctx"
+    assert result[0].text == "api-res"
+
+
+async def test_handle_api_resources_error():
+    with patch("k8s_mcp.tools.awareness.kubectl", side_effect=KubectlError("no api")):
+        result = await handle_api_resources({})
+    assert "Error" in result[0].text
+
+
+

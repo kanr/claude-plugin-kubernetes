@@ -10,26 +10,27 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 
 # Run the MCP server directly (for debugging)
-.venv/bin/python -m src.server
+.venv/bin/python -m k8s_mcp.server
 ```
 
 The server is registered via `.mcp.json` in the project root and is picked up automatically by Claude Code. After code changes, restart the MCP server with `/mcp` in Claude Code to reload.
 
 ## Architecture
 
-The server exposes 21 `kubectl`-backed tools over MCP stdio transport. Every tool follows the same pattern: a `Tool` definition (name, description, inputSchema) lives alongside its async handler function in the same file.
+The server exposes 48 `kubectl`-backed tools over MCP stdio transport. Every tool follows the same pattern: a `Tool` definition (name, description, inputSchema) lives alongside its async handler function in the same file.
 
 **Data flow:** `server.py` → dispatches to handler in `tools/` → calls `kubectl()` or `kubectl_json()` in `kubectl.py` → returns `list[TextContent]`
 
-### `src/kubectl.py` — the only place kubectl is invoked
+### `k8s_mcp/kubectl.py` — the only place kubectl is invoked
 
 - `kubectl(args, *, context, namespace, all_namespaces)` — runs kubectl, returns stdout string
 - `kubectl_json(args, ...)` — appends `-o json` and parses result
 - `kubectl_stdin(args, stdin_data, ...)` — pipes data to stdin (used by `apply -f -`)
+- `kubectl_diff(stdin_data, *, context, namespace)` — runs `diff -f -`, returns `(returncode, stdout, stderr)`; exit code 0 = no diff, 1 = has diff, >1 = error
 - `_build_args()` — assembles the full arg list: `[--context X] [--namespace Y] + args + [--all-namespaces]`
   - **Important:** `--all-namespaces` goes in a *suffix*, not prefix — it must come after the subcommand
 
-### `src/tools/`
+### `k8s_mcp/tools/`
 
 Each module exports two dicts consumed by `server.py`:
 - `{CATEGORY}_TOOLS: list[Tool]` — MCP tool definitions with inputSchema
@@ -37,11 +38,11 @@ Each module exports two dicts consumed by `server.py`:
 
 | Module | Tools | Notes |
 |---|---|---|
-| `awareness.py` | 8 read-only | `handle_cluster_info` runs 3 kubectl calls in parallel via `asyncio.gather` |
-| `diagnostics.py` | 6 read-only | `handle_find_issues` runs 4 health checks in parallel; `_check_*` helpers return `list[str]` issue lines |
-| `remediation.py` | 7 write | Risk levels in tool descriptions: LOW / MEDIUM / HIGH |
+| `awareness.py` | 28 read-only | `handle_cluster_info` runs 3 kubectl calls in parallel, degrades gracefully per-call; includes RBAC, storage, quota, and PDB listing tools |
+| `diagnostics.py` | 11 read-only | `handle_find_issues` runs 8 health checks in parallel; `_check_*` helpers return `list[str]` issue lines; includes exec, log-by-selector, and rollout tools |
+| `remediation.py` | 9 write | Risk levels in tool descriptions: LOW / MEDIUM / HIGH |
 
-### `src/formatters.py`
+### `k8s_mcp/formatters.py`
 
 Shared helpers: `severity_icon()`, `node_conditions_summary()`, `kv_table()`, `bullet_list()`. Used primarily in `diagnostics.py`.
 
@@ -56,6 +57,7 @@ Shared helpers: `severity_icon()`, `node_conditions_summary()`, `kv_table()`, `b
 
 - `kubectl version --short` is used in `handle_cluster_info`; `--short` is deprecated in newer kubectl but still works
 - `kubectl_stdin` captures stderr on success too (kubectl apply writes resource status to stderr)
+- `k8s_list_events` defaults `all_namespaces` to `True` when no explicit namespace is given; scoped when namespace is provided
 - `pyproject.toml` uses `build-backend = "setuptools.build_meta"` — the newer `.backends.legacy:build` variant fails on Python 3.11's bundled setuptools
 
 ## Coauthoring

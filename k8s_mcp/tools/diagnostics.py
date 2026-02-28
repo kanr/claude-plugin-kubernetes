@@ -2,13 +2,17 @@
 Diagnostic tools — read-only operations for troubleshooting.
 
 Tools:
-  k8s_describe      — kubectl describe any resource
-  k8s_logs          — get pod logs (tail, container, previous, error filtering)
-  k8s_top_pods      — pod CPU/memory usage
-  k8s_top_nodes     — node CPU/memory usage
-  k8s_find_issues   — comprehensive cluster health scan
-  k8s_get_yaml      — get resource as YAML
-  k8s_self_test     — MCP plugin health check
+  k8s_describe         — kubectl describe any resource
+  k8s_logs             — get pod logs (tail, container, previous, error filtering)
+  k8s_logs_selector    — get aggregated logs from pods matching a label selector
+  k8s_top_pods         — pod CPU/memory usage
+  k8s_top_nodes        — node CPU/memory usage
+  k8s_find_issues      — comprehensive cluster health scan
+  k8s_get_yaml         — get resource as YAML
+  k8s_exec             — execute a command in a pod container (non-interactive)
+  k8s_rollout_status   — check deployment rollout progress
+  k8s_rollout_history  — view deployment rollout history
+  k8s_self_test        — MCP plugin health check
 """
 
 from __future__ import annotations
@@ -125,8 +129,8 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
         description=(
             "Perform a comprehensive cluster health scan and report all detected problems. "
             "Checks: non-Running/non-Succeeded pods, high-restart pods, nodes with "
-            "pressure/NotReady conditions, deployments/statefulsets with unavailable replicas, "
-            "failed jobs, pending PVCs, and recent Warning events. "
+            "pressure/NotReady conditions, deployments/statefulsets/daemonsets with unavailable "
+            "replicas, failed jobs, pending PVCs, and recent Warning events. "
             "Run this first when diagnosing cluster problems."
         ),
         inputSchema={
@@ -171,6 +175,69 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
         annotations=_RO,
     ),
     Tool(
+        name="k8s_exec",
+        description=(
+            "Execute a command inside a running pod container and return the output. "
+            "Useful for live debugging: checking files, environment variables, network "
+            "connectivity, and application state. Non-interactive only — runs the command "
+            "via `sh -c` and returns output. "
+            "Example: command='ls /app/config' or command='env | grep DB_'."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["pod_name", "command"],
+            "properties": {
+                "pod_name": {"type": "string", "description": "Name of the pod."},
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to run inside the pod, e.g. 'ls /app' or 'cat /etc/hosts'.",
+                },
+                "container": {
+                    "type": "string",
+                    "description": "Container name (omit for single-container pods).",
+                },
+                "namespace": {"type": "string"},
+                "context": {"type": "string"},
+            },
+        },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    ),
+    Tool(
+        name="k8s_logs_selector",
+        description=(
+            "Fetch logs from all pods matching a label selector. Aggregates output from "
+            "multiple pods, each log line prefixed with the pod name. Useful when "
+            "investigating a failing deployment or service across its replica set. "
+            "Example: label_selector='app=api,env=prod'."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["label_selector"],
+            "properties": {
+                "label_selector": {
+                    "type": "string",
+                    "description": "Label selector to match pods, e.g. 'app=nginx' or 'app=api,env=prod'.",
+                },
+                "namespace": {"type": "string"},
+                "container": {
+                    "type": "string",
+                    "description": "Container name (for multi-container pods).",
+                },
+                "tail": {
+                    "type": "integer",
+                    "description": "Lines from the end per pod. Default 50.",
+                    "default": 50,
+                },
+                "since": {
+                    "type": "string",
+                    "description": "Show logs since a relative duration, e.g. '5m', '1h'.",
+                },
+                "context": {"type": "string"},
+            },
+        },
+        annotations=_RO,
+    ),
+    Tool(
         name="k8s_self_test",
         description=(
             "Run a health check on the MCP plugin itself. Verifies kubectl binary, "
@@ -179,6 +246,40 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {},
+        },
+        annotations=_RO,
+    ),
+    Tool(
+        name="k8s_rollout_status",
+        description=(
+            "Check the rollout status of a deployment. Returns current rollout progress "
+            "and whether the rollout completed successfully. Times out after 30 seconds."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["deployment_name"],
+            "properties": {
+                "deployment_name": {"type": "string", "description": "Name of the deployment."},
+                "namespace": {"type": "string"},
+                "context": {"type": "string"},
+            },
+        },
+        annotations=_RO,
+    ),
+    Tool(
+        name="k8s_rollout_history",
+        description=(
+            "View the rollout history of a deployment, showing all recorded revisions. "
+            "Useful for deciding which revision to roll back to."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["deployment_name"],
+            "properties": {
+                "deployment_name": {"type": "string", "description": "Name of the deployment."},
+                "namespace": {"type": "string"},
+                "context": {"type": "string"},
+            },
         },
         annotations=_RO,
     ),
@@ -302,19 +403,20 @@ async def handle_find_issues(args: dict) -> list[TextContent]:
     all_ns = ns is None
     restart_threshold = args.get("restart_threshold", 5)
 
-    # Run all 7 checks in parallel
+    # Run all 8 checks in parallel
     results = await asyncio.gather(
         _check_pods(ctx, ns, all_ns, restart_threshold),
         _check_nodes(ctx),
         _check_deployments(ctx, ns, all_ns),
         _check_statefulsets(ctx, ns, all_ns),
+        _check_daemonsets(ctx, ns, all_ns),
         _check_jobs(ctx, ns, all_ns),
         _check_pvcs(ctx, ns, all_ns),
         _check_events(ctx, ns, all_ns),
         return_exceptions=True,
     )
 
-    pod_result, node_result, deploy_result, sts_result, job_result, pvc_result, event_result = results
+    pod_result, node_result, deploy_result, sts_result, ds_result, job_result, pvc_result, event_result = results
 
     # Unpack pod result — it returns (critical, warning) tuple
     if isinstance(pod_result, Exception):
@@ -370,6 +472,12 @@ async def handle_find_issues(args: dict) -> list[TextContent]:
         warning_items.append(f"(statefulset scan failed: {sts_result})")
     else:
         warning_items.extend(sts_result)
+
+    # DaemonSet issues -> warning
+    if isinstance(ds_result, Exception):
+        warning_items.append(f"(daemonset scan failed: {ds_result})")
+    else:
+        warning_items.extend(ds_result)
 
     # Job issues -> warning
     if isinstance(job_result, Exception):
@@ -451,10 +559,15 @@ async def handle_get_yaml(args: dict) -> list[TextContent]:
 
 async def handle_self_test(args: dict) -> list[TextContent]:
     """Run health checks on the MCP plugin itself."""
+    import os
     from k8s_mcp.tools.awareness import AWARENESS_TOOLS
     from k8s_mcp.tools.remediation import REMEDIATION_TOOLS
 
-    total_tools = len(DIAGNOSTIC_TOOLS) + len(AWARENESS_TOOLS) + len(REMEDIATION_TOOLS)
+    read_only = os.environ.get("K8S_MCP_READ_ONLY", "").lower() in ("1", "true", "yes")
+    if read_only:
+        total_tools = len(DIAGNOSTIC_TOOLS) + len(AWARENESS_TOOLS)
+    else:
+        total_tools = len(DIAGNOSTIC_TOOLS) + len(AWARENESS_TOOLS) + len(REMEDIATION_TOOLS)
 
     # Run all 4 checks in parallel
     results = await asyncio.gather(
@@ -685,6 +798,33 @@ async def _check_statefulsets(ctx, ns, all_ns) -> list[str]:
     return issues
 
 
+async def _check_daemonsets(ctx, ns, all_ns) -> list[str]:
+    """Check DaemonSets for nodes where pods are not ready."""
+    data = await kubectl_json(
+        ["get", "daemonsets"],
+        context=ctx,
+        namespace=ns,
+        all_namespaces=all_ns,
+    )
+    items = data.get("items", [])
+    issues: list[str] = []
+
+    for ds in items:
+        ds_ns = ds["metadata"]["namespace"]
+        ds_name = ds["metadata"]["name"]
+        status = ds.get("status", {})
+        desired = status.get("desiredNumberScheduled", 0)
+        ready = status.get("numberReady", 0) or 0
+
+        if desired > 0 and ready < desired:
+            unavailable = desired - ready
+            issues.append(
+                f"[{ds_ns}/{ds_name}] DaemonSet {unavailable}/{desired} pods not ready"
+            )
+
+    return issues
+
+
 async def _check_jobs(ctx, ns, all_ns) -> list[str]:
     """Check jobs for failures and stuck states."""
     data = await kubectl_json(
@@ -799,6 +939,76 @@ async def _check_events(ctx, ns, all_ns) -> tuple[list[str], dict[str, list[str]
 # Dispatch
 # ---------------------------------------------------------------------------
 
+async def handle_exec(args: dict) -> list[TextContent]:
+    pod = args["pod_name"]
+    command = args["command"]
+    ctx = args.get("context")
+    ns = args.get("namespace")
+    container = args.get("container")
+
+    cmd = ["exec", pod]
+    if container:
+        cmd += ["-c", container]
+    cmd += ["--", "sh", "-c", command]
+
+    try:
+        out = await kubectl(cmd, context=ctx, namespace=ns)
+    except KubectlError as e:
+        return _err(str(e))
+    return [TextContent(type="text", text=out if out else "(no output)")]
+
+
+async def handle_logs_selector(args: dict) -> list[TextContent]:
+    selector = args["label_selector"]
+    ctx = args.get("context")
+    ns = args.get("namespace")
+    container = args.get("container")
+    tail = args.get("tail", 50)
+    since = args.get("since")
+
+    cmd = ["logs", "-l", selector, f"--tail={tail}", "--prefix=true"]
+    if container:
+        cmd += ["-c", container]
+    if since:
+        cmd += [f"--since={since}"]
+
+    try:
+        out = await kubectl(cmd, context=ctx, namespace=ns)
+    except KubectlError as e:
+        return _err(str(e))
+    return [TextContent(type="text", text=out if out else "(no log output)")]
+
+
+async def handle_rollout_status(args: dict) -> list[TextContent]:
+    name = args["deployment_name"]
+    ctx = args.get("context")
+    ns = args.get("namespace")
+    try:
+        out = await kubectl(
+            ["rollout", "status", f"deployment/{name}", "--timeout=30s"],
+            context=ctx,
+            namespace=ns,
+        )
+    except KubectlError as e:
+        return _err(str(e))
+    return [TextContent(type="text", text=out)]
+
+
+async def handle_rollout_history(args: dict) -> list[TextContent]:
+    name = args["deployment_name"]
+    ctx = args.get("context")
+    ns = args.get("namespace")
+    try:
+        out = await kubectl(
+            ["rollout", "history", f"deployment/{name}"],
+            context=ctx,
+            namespace=ns,
+        )
+    except KubectlError as e:
+        return _err(str(e))
+    return [TextContent(type="text", text=out)]
+
+
 DIAGNOSTIC_HANDLERS = {
     "k8s_describe": handle_describe,
     "k8s_logs": handle_logs,
@@ -806,7 +1016,11 @@ DIAGNOSTIC_HANDLERS = {
     "k8s_top_nodes": handle_top_nodes,
     "k8s_find_issues": handle_find_issues,
     "k8s_get_yaml": handle_get_yaml,
+    "k8s_exec": handle_exec,
+    "k8s_logs_selector": handle_logs_selector,
     "k8s_self_test": handle_self_test,
+    "k8s_rollout_status": handle_rollout_status,
+    "k8s_rollout_history": handle_rollout_history,
 }
 
 
