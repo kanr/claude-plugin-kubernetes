@@ -39,7 +39,8 @@ from collections import Counter
 
 from mcp.types import TextContent, Tool, ToolAnnotations
 
-from k8s_mcp.kubectl import KubectlError, kubectl
+from k8s_mcp.formatters import _err
+from k8s_mcp.kubectl import KubectlError, kubectl, kubectl_json
 
 
 # ---------------------------------------------------------------------------
@@ -48,10 +49,6 @@ from k8s_mcp.kubectl import KubectlError, kubectl
 
 async def _gather(*coros):
     return await asyncio.gather(*coros, return_exceptions=True)
-
-
-def _err(msg: str) -> list[TextContent]:
-    return [TextContent(type="text", text=f"Error: {msg}")]
 
 
 def _find_col_index(headers: list[str], *candidates: str) -> int | None:
@@ -90,7 +87,10 @@ def _col_values(headers: list[str], rows: list[list[str]], *col_names: str) -> l
 # ---------------------------------------------------------------------------
 
 def _summarize_pods(output: str) -> str:
-    """Prepend a summary like '15 pods (12 Running, 2 Pending, 1 CrashLoopBackOff)'."""
+    """Prepend a summary like '15 pods (12 Running, 2 Pending, 1 CrashLoopBackOff)'.
+
+    Also appends next-step suggestions when unhealthy pods are detected.
+    """
     headers, rows = _parse_table_rows(output)
     if not rows:
         return output
@@ -101,7 +101,33 @@ def _summarize_pods(output: str) -> str:
     total = len(statuses)
     parts = ", ".join(f"{v} {k}" for k, v in counts.most_common())
     summary = f"{total} pods ({parts})"
-    return f"{summary}\n\n{output}"
+
+    # Next-step suggestions for unhealthy pods
+    _UNHEALTHY = {"CrashLoopBackOff", "Error", "ImagePullBackOff", "ErrImagePull",
+                  "Pending", "CreateContainerError", "OOMKilled", "Init:Error",
+                  "Init:CrashLoopBackOff"}
+    unhealthy = {s for s in counts if s in _UNHEALTHY}
+    suggestions: list[str] = []
+    if unhealthy:
+        # Find pod names with unhealthy statuses
+        name_idx = _find_col_index(headers, "NAME")
+        ns_idx = _find_col_index(headers, "NAMESPACE")
+        status_idx = _find_col_index(headers, "STATUS")
+        if name_idx is not None and status_idx is not None:
+            for row in rows[:3]:  # Suggest for first 3 unhealthy pods
+                if status_idx < len(row) and row[status_idx] in _UNHEALTHY:
+                    pod = row[name_idx] if name_idx < len(row) else "?"
+                    ns_hint = f' namespace="{row[ns_idx]}"' if ns_idx is not None and ns_idx < len(row) else ""
+                    suggestions.append(f'-> Suggested: k8s_describe resource_type="pod" resource_name="{pod}"{ns_hint}')
+                    suggestions.append(f'-> Suggested: k8s_logs pod_name="{pod}"{ns_hint}')
+                    break  # One pod example is enough
+        if not suggestions:
+            suggestions.append("-> Suggested: k8s_find_issues to identify root causes")
+
+    result = f"{summary}\n\n{output}"
+    if suggestions:
+        result += "\n\n" + "\n".join(suggestions)
+    return result
 
 
 def _summarize_deployments(output: str) -> str:
@@ -110,20 +136,39 @@ def _summarize_deployments(output: str) -> str:
     if not rows:
         return output
     ready_idx = _find_col_index(headers, "READY")
+    name_idx = _find_col_index(headers, "NAME")
+    ns_idx = _find_col_index(headers, "NAMESPACE")
     if ready_idx is None:
         return f"{len(rows)} deployments\n\n{output}"
     degraded = 0
+    degraded_names: list[tuple[str, str | None]] = []
     for row in rows:
         if ready_idx < len(row):
             parts = row[ready_idx].split("/")
             if len(parts) == 2 and parts[0] != parts[1]:
                 degraded += 1
+                dep_name = row[name_idx] if name_idx is not None and name_idx < len(row) else None
+                dep_ns = row[ns_idx] if ns_idx is not None and ns_idx < len(row) else None
+                if dep_name and len(degraded_names) < 3:
+                    degraded_names.append((dep_name, dep_ns))
     total = len(rows)
     if degraded:
         summary = f"{total} deployments ({degraded} degraded — ready != desired)"
     else:
         summary = f"{total} deployments (all healthy)"
-    return f"{summary}\n\n{output}"
+
+    result = f"{summary}\n\n{output}"
+
+    # Next-step suggestions for degraded deployments
+    if degraded_names:
+        suggestions: list[str] = []
+        for dname, dns in degraded_names[:1]:  # Suggest for first degraded
+            ns_hint = f' namespace="{dns}"' if dns else ""
+            suggestions.append(f'-> Suggested: k8s_describe resource_type="deployment" resource_name="{dname}"{ns_hint}')
+            suggestions.append(f"-> Suggested: k8s_find_issues to identify root causes")
+        result += "\n\n" + "\n".join(suggestions)
+
+    return result
 
 
 def _summarize_nodes(output: str) -> str:
@@ -184,16 +229,16 @@ def _summarize_events(output: str, warnings_only: bool) -> str:
 _NS_SCHEMA = {
     "type": "object",
     "properties": {
-        "namespace": {"type": "string", "description": "Namespace filter."},
-        "all_namespaces": {"type": "boolean", "default": False},
-        "context": {"type": "string", "description": "Kubeconfig context name."},
+        "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+        "all_namespaces": {"type": "boolean", "default": False, "description": "Search across all namespaces. Default: false."},
+        "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
     },
 }
 
 _CLUSTER_SCOPED_SCHEMA = {
     "type": "object",
     "properties": {
-        "context": {"type": "string", "description": "Kubeconfig context name."},
+        "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
     },
 }
 
@@ -237,7 +282,7 @@ AWARENESS_TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
-                "context": {"type": "string", "description": "Kubeconfig context name."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO_ANNOTATIONS,
@@ -251,7 +296,7 @@ AWARENESS_TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
-                "context": {"type": "string", "description": "Kubeconfig context name."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO_ANNOTATIONS,
@@ -268,18 +313,18 @@ AWARENESS_TOOLS: list[Tool] = [
             "properties": {
                 "namespace": {
                     "type": "string",
-                    "description": "Namespace to list pods in. Omit for current namespace.",
+                    "description": "Kubernetes namespace. Defaults to current context's namespace.",
                 },
                 "all_namespaces": {
                     "type": "boolean",
-                    "description": "List pods across all namespaces.",
+                    "description": "Search across all namespaces. Default: false.",
                     "default": False,
                 },
                 "label_selector": {
                     "type": "string",
                     "description": "Label selector, e.g. 'app=nginx,env=prod'.",
                 },
-                "context": {"type": "string", "description": "Kubeconfig context name."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO_ANNOTATIONS,
@@ -293,9 +338,9 @@ AWARENESS_TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
-                "namespace": {"type": "string", "description": "Namespace filter."},
-                "all_namespaces": {"type": "boolean", "default": False},
-                "context": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "all_namespaces": {"type": "boolean", "default": False, "description": "Search across all namespaces. Default: false."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO_ANNOTATIONS,
@@ -308,9 +353,9 @@ AWARENESS_TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
-                "namespace": {"type": "string", "description": "Namespace filter."},
-                "all_namespaces": {"type": "boolean", "default": False},
-                "context": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "all_namespaces": {"type": "boolean", "default": False, "description": "Search across all namespaces. Default: false."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO_ANNOTATIONS,
@@ -327,7 +372,7 @@ AWARENESS_TOOLS: list[Tool] = [
             "properties": {
                 "namespace": {"type": "string", "description": "Namespace filter."},
                 "all_namespaces": {"type": "boolean", "default": False},
-                "context": {"type": "string", "description": "Kubeconfig context name."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO_ANNOTATIONS,
@@ -346,13 +391,13 @@ AWARENESS_TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Namespace to scope events. Omit for all namespaces.",
                 },
-                "all_namespaces": {"type": "boolean", "default": True},
+                "all_namespaces": {"type": "boolean", "default": True, "description": "Search across all namespaces. Default: true (unlike other tools)."},
                 "warnings_only": {
                     "type": "boolean",
                     "description": "Show only Warning events.",
                     "default": False,
                 },
-                "context": {"type": "string"},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO_ANNOTATIONS,
@@ -451,7 +496,7 @@ AWARENESS_TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
-                "context": {"type": "string", "description": "Kubeconfig context name."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO_ANNOTATIONS,
@@ -530,6 +575,77 @@ AWARENESS_TOOLS: list[Tool] = [
             "rolling upgrades."
         ),
         inputSchema=_NS_SCHEMA,
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_get",
+        description=(
+            "Get any Kubernetes resource type, including CRDs. Use this for resource "
+            "types not covered by a dedicated list tool (e.g. replicasets, endpoints, "
+            "Argo Workflows, Istio VirtualServices, Cert-Manager Certificates). "
+            "Optionally specify a resource name to get a single resource. "
+            "Supports label and field selectors for filtering."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["resource_type"],
+            "properties": {
+                "resource_type": {
+                    "type": "string",
+                    "description": (
+                        "Kubernetes resource type, e.g. 'replicasets', 'endpoints', "
+                        "'virtualservices.networking.istio.io', 'certificates.cert-manager.io'."
+                    ),
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Get a single resource by name. Omit to list all.",
+                },
+                "output": {
+                    "type": "string",
+                    "enum": ["wide", "yaml", "json", "name"],
+                    "default": "wide",
+                    "description": "Output format. 'wide' (default) for tabular, 'yaml'/'json' for full definition, 'name' for names only.",
+                },
+                "label_selector": {
+                    "type": "string",
+                    "description": "Label selector filter, e.g. 'app=nginx,env=prod'.",
+                },
+                "field_selector": {
+                    "type": "string",
+                    "description": "Field selector filter, e.g. 'status.phase=Running'.",
+                },
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "all_namespaces": {"type": "boolean", "default": False, "description": "Search across all namespaces."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
+            },
+        },
+        annotations=_RO_ANNOTATIONS,
+    ),
+    Tool(
+        name="k8s_get_configmap_data",
+        description=(
+            "Read the data contents of a specific ConfigMap. Returns all key-value "
+            "pairs stored in the ConfigMap. Use this to inspect configuration values, "
+            "check for missing keys, or verify settings. For binary data keys, shows "
+            "the key name and byte size only."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["configmap_name"],
+            "properties": {
+                "configmap_name": {
+                    "type": "string",
+                    "description": "Name of the ConfigMap to read.",
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Return only this specific key's value. Omit to return all keys.",
+                },
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
+            },
+        },
         annotations=_RO_ANNOTATIONS,
     ),
 ]
@@ -674,8 +790,8 @@ async def handle_list_events(args: dict) -> list[TextContent]:
 
 # --- New handlers ---
 
-async def _simple_list(args: dict, resource: str) -> list[TextContent]:
-    """Generic handler for simple list operations."""
+async def _simple_list(args: dict, resource: str, *, resource_label: str | None = None) -> list[TextContent]:
+    """Generic handler for simple list operations. Prepends a count summary."""
     ctx = args.get("context")
     ns = args.get("namespace")
     all_ns = args.get("all_namespaces", False)
@@ -683,47 +799,54 @@ async def _simple_list(args: dict, resource: str) -> list[TextContent]:
         out = await kubectl(["get", resource], context=ctx, namespace=ns, all_namespaces=all_ns)
     except KubectlError as e:
         return _err(str(e))
+    # Add a summary header with the resource count
+    label = resource_label or resource
+    headers, rows = _parse_table_rows(out)
+    if rows:
+        scope = "all namespaces" if all_ns else (ns or "current namespace")
+        summary = f"{len(rows)} {label} in {scope}"
+        out = f"{summary}\n\n{out}"
     return [TextContent(type="text", text=out)]
 
 
 async def handle_list_statefulsets(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "statefulsets")
+    return await _simple_list(args, "statefulsets", resource_label="statefulsets")
 
 
 async def handle_list_ingresses(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "ingress")
+    return await _simple_list(args, "ingress", resource_label="ingresses")
 
 
 async def handle_list_jobs(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "jobs")
+    return await _simple_list(args, "jobs", resource_label="jobs")
 
 
 async def handle_list_cronjobs(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "cronjobs")
+    return await _simple_list(args, "cronjobs", resource_label="cronjobs")
 
 
 async def handle_list_configmaps(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "configmaps")
+    return await _simple_list(args, "configmaps", resource_label="configmaps")
 
 
 async def handle_list_secrets(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "secrets")
+    return await _simple_list(args, "secrets", resource_label="secrets")
 
 
 async def handle_list_pvcs(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "pvc")
+    return await _simple_list(args, "pvc", resource_label="PVCs")
 
 
 async def handle_list_daemonsets(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "daemonsets")
+    return await _simple_list(args, "daemonsets", resource_label="daemonsets")
 
 
 async def handle_list_hpa(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "hpa")
+    return await _simple_list(args, "hpa", resource_label="HPAs")
 
 
 async def handle_list_networkpolicies(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "networkpolicies")
+    return await _simple_list(args, "networkpolicies", resource_label="network policies")
 
 
 async def handle_api_resources(args: dict) -> list[TextContent]:
@@ -738,15 +861,15 @@ async def handle_api_resources(args: dict) -> list[TextContent]:
 # --- RBAC handlers ---
 
 async def handle_list_serviceaccounts(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "serviceaccounts")
+    return await _simple_list(args, "serviceaccounts", resource_label="service accounts")
 
 
 async def handle_list_roles(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "roles")
+    return await _simple_list(args, "roles", resource_label="roles")
 
 
 async def handle_list_rolebindings(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "rolebindings")
+    return await _simple_list(args, "rolebindings", resource_label="role bindings")
 
 
 # --- Storage handlers ---
@@ -772,15 +895,127 @@ async def handle_list_storageclasses(args: dict) -> list[TextContent]:
 # --- Resource governance handlers ---
 
 async def handle_list_resourcequotas(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "resourcequotas")
+    return await _simple_list(args, "resourcequotas", resource_label="resource quotas")
 
 
 async def handle_list_limitranges(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "limitranges")
+    return await _simple_list(args, "limitranges", resource_label="limit ranges")
 
 
 async def handle_list_poddisruptionbudgets(args: dict) -> list[TextContent]:
-    return await _simple_list(args, "poddisruptionbudgets")
+    return await _simple_list(args, "poddisruptionbudgets", resource_label="pod disruption budgets")
+
+
+async def handle_get(args: dict) -> list[TextContent]:
+    """Generic get handler for any resource type including CRDs."""
+    rtype = args["resource_type"]
+    name = args.get("name")
+    output = args.get("output", "wide")
+    label_selector = args.get("label_selector")
+    field_selector = args.get("field_selector")
+    ctx = args.get("context")
+    ns = args.get("namespace")
+    all_ns = args.get("all_namespaces", False)
+
+    cmd = ["get", rtype]
+    if name:
+        cmd.append(name)
+
+    if output == "wide":
+        cmd += ["-o", "wide"]
+    elif output in ("yaml", "json"):
+        cmd += ["-o", output]
+    elif output == "name":
+        cmd += ["-o", "name"]
+
+    if label_selector:
+        cmd += ["-l", label_selector]
+    if field_selector:
+        cmd += ["--field-selector", field_selector]
+
+    try:
+        out = await kubectl(cmd, context=ctx, namespace=ns, all_namespaces=all_ns)
+    except KubectlError as e:
+        return _err(str(e))
+
+    # Strip managed fields from YAML output for readability
+    if output == "yaml" and not name:
+        return [TextContent(type="text", text=out)]
+
+    if output == "yaml" and name:
+        try:
+            import yaml as _yaml
+            data = _yaml.safe_load(out)
+            if isinstance(data, dict):
+                metadata = data.get("metadata", {})
+                metadata.pop("managedFields", None)
+                annotations = metadata.get("annotations", {})
+                annotations.pop("kubectl.kubernetes.io/last-applied-configuration", None)
+                if not annotations and "annotations" in metadata:
+                    del metadata["annotations"]
+                out = _yaml.dump(data, default_flow_style=False, sort_keys=False)
+        except Exception:
+            pass  # Return raw output on any parse error
+
+    # Add summary for tabular outputs
+    if output in ("wide", "name") and not name:
+        headers, rows = _parse_table_rows(out)
+        if rows:
+            scope = "all namespaces" if all_ns else (ns or "current namespace")
+            summary = f"{len(rows)} {rtype} in {scope}"
+            out = f"{summary}\n\n{out}"
+
+    return [TextContent(type="text", text=out)]
+
+
+async def handle_get_configmap_data(args: dict) -> list[TextContent]:
+    """Read the data contents of a ConfigMap."""
+    cm_name = args["configmap_name"]
+    key = args.get("key")
+    ctx = args.get("context")
+    ns = args.get("namespace")
+
+    try:
+        data = await kubectl_json(["get", "configmap", cm_name], context=ctx, namespace=ns)
+    except KubectlError as e:
+        return _err(str(e))
+
+    cm_data = data.get("data") or {}
+    binary_data = data.get("binaryData") or {}
+
+    if key:
+        if key in cm_data:
+            return [TextContent(type="text", text=f"{key}:\n{cm_data[key]}")]
+        elif key in binary_data:
+            import base64
+            size = len(base64.b64decode(binary_data[key]))
+            return [TextContent(type="text", text=f"{key}: (binary data, {size} bytes)")]
+        else:
+            available = sorted(list(cm_data.keys()) + list(binary_data.keys()))
+            return _err(f"Key '{key}' not found in ConfigMap '{cm_name}'. Available keys: {available}")
+
+    parts: list[str] = []
+    parts.append(f"ConfigMap: {cm_name}")
+    parts.append(f"Keys: {len(cm_data) + len(binary_data)}")
+    parts.append("")
+
+    for k, v in cm_data.items():
+        # Truncate very long values
+        if len(v) > 2000:
+            v_display = v[:2000] + f"\n... ({len(v)} bytes total, truncated)"
+        else:
+            v_display = v
+        parts.append(f"--- {k} ---")
+        parts.append(v_display)
+        parts.append("")
+
+    for k, v in binary_data.items():
+        import base64
+        size = len(base64.b64decode(v))
+        parts.append(f"--- {k} (binary, {size} bytes) ---")
+        parts.append("")
+
+    return [TextContent(type="text", text="\n".join(parts).rstrip())]
 
 
 # ---------------------------------------------------------------------------
@@ -816,4 +1051,6 @@ AWARENESS_HANDLERS = {
     "k8s_list_resourcequotas": handle_list_resourcequotas,
     "k8s_list_limitranges": handle_list_limitranges,
     "k8s_list_poddisruptionbudgets": handle_list_poddisruptionbudgets,
+    "k8s_get": handle_get,
+    "k8s_get_configmap_data": handle_get_configmap_data,
 }

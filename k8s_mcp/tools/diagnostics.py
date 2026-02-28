@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from mcp.types import TextContent, Tool, ToolAnnotations
 
 from k8s_mcp.kubectl import KubectlError, kubectl, kubectl_json
-from k8s_mcp.formatters import node_conditions_summary, severity_icon
+from k8s_mcp.formatters import _err, node_conditions_summary, severity_icon
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +55,8 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Name of the resource to describe.",
                 },
-                "namespace": {"type": "string", "description": "Namespace (omit for cluster-scoped resources)."},
-                "context": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Omit for cluster-scoped resources."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO,
@@ -73,7 +73,7 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
             "required": ["pod_name"],
             "properties": {
                 "pod_name": {"type": "string", "description": "Pod name."},
-                "namespace": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
                 "container": {"type": "string", "description": "Container name (omit for single-container pods)."},
                 "tail": {
                     "type": "integer",
@@ -94,7 +94,7 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                     "enum": ["errors"],
                     "description": "Filter log output to show only lines matching common error patterns.",
                 },
-                "context": {"type": "string"},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO,
@@ -105,10 +105,10 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
-                "namespace": {"type": "string"},
-                "all_namespaces": {"type": "boolean", "default": False},
-                "label_selector": {"type": "string"},
-                "context": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "all_namespaces": {"type": "boolean", "default": False, "description": "Search across all namespaces. Default: false."},
+                "label_selector": {"type": "string", "description": "Label selector filter, e.g. 'app=nginx'."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO,
@@ -119,7 +119,7 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
-                "context": {"type": "string"},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO,
@@ -140,7 +140,7 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Scope scan to a namespace. Omit to scan all namespaces.",
                 },
-                "context": {"type": "string"},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
                 "restart_threshold": {
                     "type": "integer",
                     "description": "Flag pods with restart count above this number. Default 5.",
@@ -162,9 +162,9 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
             "required": ["resource_type", "resource_name"],
             "properties": {
                 "resource_type": {"type": "string", "description": "e.g. deployment, pod, configmap, secret."},
-                "resource_name": {"type": "string"},
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
+                "resource_name": {"type": "string", "description": "Name of the resource."},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
                 "raw": {
                     "type": "boolean",
                     "description": "Return full unfiltered YAML including managed fields. Default false.",
@@ -196,8 +196,8 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Container name (omit for single-container pods).",
                 },
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
@@ -218,7 +218,7 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Label selector to match pods, e.g. 'app=nginx' or 'app=api,env=prod'.",
                 },
-                "namespace": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
                 "container": {
                     "type": "string",
                     "description": "Container name (for multi-container pods).",
@@ -232,7 +232,7 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Show logs since a relative duration, e.g. '5m', '1h'.",
                 },
-                "context": {"type": "string"},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=_RO,
@@ -252,16 +252,23 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
     Tool(
         name="k8s_rollout_status",
         description=(
-            "Check the rollout status of a deployment. Returns current rollout progress "
-            "and whether the rollout completed successfully. Times out after 30 seconds."
+            "Check the rollout status of a deployment, statefulset, or daemonset. "
+            "Returns current rollout progress and whether the rollout completed "
+            "successfully. Times out after 30 seconds."
         ),
         inputSchema={
             "type": "object",
-            "required": ["deployment_name"],
+            "required": ["name"],
             "properties": {
-                "deployment_name": {"type": "string", "description": "Name of the deployment."},
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
+                "name": {"type": "string", "description": "Name of the workload."},
+                "resource_type": {
+                    "type": "string",
+                    "enum": ["deployment", "statefulset", "daemonset"],
+                    "default": "deployment",
+                    "description": "Workload type. Default: deployment.",
+                },
+                "namespace": {"type": "string", "description": "Kubernetes namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use."},
             },
         },
         annotations=_RO,
@@ -269,16 +276,23 @@ DIAGNOSTIC_TOOLS: list[Tool] = [
     Tool(
         name="k8s_rollout_history",
         description=(
-            "View the rollout history of a deployment, showing all recorded revisions. "
-            "Useful for deciding which revision to roll back to."
+            "View the rollout history of a deployment, statefulset, or daemonset, "
+            "showing all recorded revisions. Useful for deciding which revision to "
+            "roll back to."
         ),
         inputSchema={
             "type": "object",
-            "required": ["deployment_name"],
+            "required": ["name"],
             "properties": {
-                "deployment_name": {"type": "string", "description": "Name of the deployment."},
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
+                "name": {"type": "string", "description": "Name of the workload."},
+                "resource_type": {
+                    "type": "string",
+                    "enum": ["deployment", "statefulset", "daemonset"],
+                    "default": "deployment",
+                    "description": "Workload type. Default: deployment.",
+                },
+                "namespace": {"type": "string", "description": "Kubernetes namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use."},
             },
         },
         annotations=_RO,
@@ -980,27 +994,38 @@ async def handle_logs_selector(args: dict) -> list[TextContent]:
 
 
 async def handle_rollout_status(args: dict) -> list[TextContent]:
-    name = args["deployment_name"]
+    # Support both old 'deployment_name' and new 'name' parameter
+    name = args.get("name") or args.get("deployment_name", "")
+    rtype = args.get("resource_type", "deployment")
     ctx = args.get("context")
     ns = args.get("namespace")
     try:
         out = await kubectl(
-            ["rollout", "status", f"deployment/{name}", "--timeout=30s"],
+            ["rollout", "status", f"{rtype}/{name}", "--timeout=30s"],
             context=ctx,
             namespace=ns,
         )
     except KubectlError as e:
-        return _err(str(e))
+        err_text = str(e)
+        # Suggest rollback if rollout appears stuck
+        suggestions = []
+        ns_hint = f' namespace="{ns}"' if ns else ""
+        suggestions.append(f'-> Suggested: k8s_rollout_history name="{name}" resource_type="{rtype}"{ns_hint}')
+        if rtype == "deployment":
+            suggestions.append(f'-> Suggested: k8s_rollback_deployment deployment_name="{name}"{ns_hint}')
+        return _err(err_text + "\n\n" + "\n".join(suggestions))
     return [TextContent(type="text", text=out)]
 
 
 async def handle_rollout_history(args: dict) -> list[TextContent]:
-    name = args["deployment_name"]
+    # Support both old 'deployment_name' and new 'name' parameter
+    name = args.get("name") or args.get("deployment_name", "")
+    rtype = args.get("resource_type", "deployment")
     ctx = args.get("context")
     ns = args.get("namespace")
     try:
         out = await kubectl(
-            ["rollout", "history", f"deployment/{name}"],
+            ["rollout", "history", f"{rtype}/{name}"],
             context=ctx,
             namespace=ns,
         )
@@ -1022,7 +1047,3 @@ DIAGNOSTIC_HANDLERS = {
     "k8s_rollout_status": handle_rollout_status,
     "k8s_rollout_history": handle_rollout_history,
 }
-
-
-def _err(msg: str) -> list[TextContent]:
-    return [TextContent(type="text", text=f"Error: {msg}")]

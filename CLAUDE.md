@@ -60,7 +60,13 @@ Shared helpers: `severity_icon()`, `node_conditions_summary()`, `kv_table()`, `b
 - `k8s_list_events` defaults `all_namespaces` to `True` when no explicit namespace is given; scoped when namespace is provided
 - `pyproject.toml` uses `build-backend = "setuptools.build_meta"` — the newer `.backends.legacy:build` variant fails on Python 3.11's bundled setuptools
 
-## Coauthoring
+## Commit
 
 add the follow to your commit message to have it attributed to Claude:
 `Co-Authored-By: <noreply@anthropic.com>`
+
+# Versioning
+
+this project uses [semantic versioning](https://semver.org/).
+
+when bumping the version always bump patch version unless the change includes a breaking change, then bump minor version. never bump major version. 

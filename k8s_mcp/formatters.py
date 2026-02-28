@@ -4,6 +4,26 @@ from __future__ import annotations
 
 from typing import Any
 
+from mcp.types import TextContent
+
+
+# ---------------------------------------------------------------------------
+# Shared error helper
+# ---------------------------------------------------------------------------
+
+class ToolError(list):
+    """Sentinel list subclass returned by tool handlers to indicate an error.
+
+    Wraps a ``list[TextContent]`` so existing handler return-type contracts
+    are preserved while ``server.py`` can detect errors via ``isinstance()``.
+    """
+
+
+def _err(msg: str) -> list[TextContent]:
+    """Return an error response that ``server.py`` will mark with ``isError=True``."""
+    result = ToolError([TextContent(type="text", text=f"Error: {msg}")])
+    return result
+
 
 def section(title: str, body: str) -> str:
     """Format a titled section."""

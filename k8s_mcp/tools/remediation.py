@@ -24,6 +24,7 @@ import os
 import yaml
 from mcp.types import TextContent, Tool, ToolAnnotations
 
+from k8s_mcp.formatters import _err
 from k8s_mcp.kubectl import (
     KubectlError,
     check_namespace_writable,
@@ -64,8 +65,8 @@ REMEDIATION_TOOLS: list[Tool] = [
             "required": ["deployment_name"],
             "properties": {
                 "deployment_name": {"type": "string", "description": "Name of the deployment to restart."},
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True),
@@ -97,8 +98,8 @@ REMEDIATION_TOOLS: list[Tool] = [
                     "description": "Required when replicas=0. Confirms intent to stop all pods.",
                     "default": False,
                 },
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True),
@@ -117,13 +118,13 @@ REMEDIATION_TOOLS: list[Tool] = [
             "required": ["pod_name"],
             "properties": {
                 "pod_name": {"type": "string", "description": "Name of the pod to delete."},
-                "namespace": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
                 "force": {
                     "type": "boolean",
                     "description": "Force immediate deletion (grace-period=0). Use for stuck pods only.",
                     "default": False,
                 },
-                "context": {"type": "string"},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
@@ -143,8 +144,8 @@ REMEDIATION_TOOLS: list[Tool] = [
                     "type": "integer",
                     "description": "Revision number to roll back to. Omit to roll back to the previous revision.",
                 },
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
@@ -174,7 +175,7 @@ REMEDIATION_TOOLS: list[Tool] = [
                     "description": "Perform a server-side dry run without applying changes.",
                     "default": False,
                 },
-                "context": {"type": "string"},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
@@ -183,7 +184,8 @@ REMEDIATION_TOOLS: list[Tool] = [
         name="k8s_patch_resource",
         description=(
             "[RISK: MEDIUM] Apply a strategic merge patch to any resource. Provide the "
-            "patch as a JSON string. Example: patch a deployment's image with "
+            "patch as a JSON string. Use dry_run=true to preview changes without applying. "
+            "Example: patch a deployment's image with "
             "'{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"app\",\"image\":\"nginx:1.25\"}]}}}}'."
         ),
         inputSchema={
@@ -202,8 +204,13 @@ REMEDIATION_TOOLS: list[Tool] = [
                     "default": "merge",
                     "description": "Patch type. 'merge' (default) is JSON merge patch. 'strategic' is Kubernetes strategic merge patch.",
                 },
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Perform a server-side dry run without applying the patch.",
+                    "default": False,
+                },
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
@@ -238,7 +245,7 @@ REMEDIATION_TOOLS: list[Tool] = [
                     "description": "For drain: allow deletion of pods with emptyDir volumes.",
                     "default": False,
                 },
-                "context": {"type": "string"},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
@@ -249,7 +256,8 @@ REMEDIATION_TOOLS: list[Tool] = [
         description=(
             "[RISK: MEDIUM] Delete a Kubernetes resource by type and name. "
             "The resource will be permanently removed. If managed by a controller, "
-            "it may be recreated automatically."
+            "it may be recreated automatically. Use dry_run=true to verify what "
+            "would be deleted without actually deleting."
         ),
         inputSchema={
             "type": "object",
@@ -257,8 +265,13 @@ REMEDIATION_TOOLS: list[Tool] = [
             "properties": {
                 "resource_type": {"type": "string", "description": "Resource type, e.g. deployment, service, configmap, secret."},
                 "resource_name": {"type": "string", "description": "Name of the resource to delete."},
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Perform a server-side dry run without actually deleting.",
+                    "default": False,
+                },
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
@@ -278,8 +291,8 @@ REMEDIATION_TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Full YAML or JSON manifest content to diff against live state.",
                 },
-                "namespace": {"type": "string"},
-                "context": {"type": "string"},
+                "namespace": {"type": "string", "description": "Kubernetes namespace. Defaults to current context's namespace."},
+                "context": {"type": "string", "description": "Kubernetes context to use. Defaults to current context."},
             },
         },
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True),
@@ -428,16 +441,17 @@ async def handle_patch_resource(args: dict) -> list[TextContent]:
     rname = args["resource_name"]
     patch = args["patch"]
     patch_type = args.get("patch_type", "merge")
+    dry_run = args.get("dry_run", False)
     ctx = args.get("context")
     ns = args.get("namespace")
     check_namespace_writable(ns)
 
+    cmd = ["patch", rtype, rname, f"--type={patch_type}", "-p", patch]
+    if dry_run:
+        cmd += ["--dry-run=server"]
+
     try:
-        out = await kubectl(
-            ["patch", rtype, rname, f"--type={patch_type}", "-p", patch],
-            context=ctx,
-            namespace=ns,
-        )
+        out = await kubectl(cmd, context=ctx, namespace=ns)
     except KubectlError as e:
         return _err(str(e))
     return [TextContent(type="text", text=out)]
@@ -476,16 +490,17 @@ async def handle_node_operation(args: dict) -> list[TextContent]:
 async def handle_delete_resource(args: dict) -> list[TextContent]:
     rtype = args["resource_type"]
     rname = args["resource_name"]
+    dry_run = args.get("dry_run", False)
     ctx = args.get("context")
     ns = args.get("namespace")
     check_namespace_writable(ns)
 
+    cmd = ["delete", rtype, rname]
+    if dry_run:
+        cmd += ["--dry-run=server"]
+
     try:
-        out = await kubectl(
-            ["delete", rtype, rname],
-            context=ctx,
-            namespace=ns,
-        )
+        out = await kubectl(cmd, context=ctx, namespace=ns)
     except KubectlError as e:
         return _err(str(e))
     return [TextContent(type="text", text=out)]
@@ -529,7 +544,3 @@ REMEDIATION_HANDLERS = {
     "k8s_delete_resource": handle_delete_resource,
     "k8s_diff": handle_diff,
 }
-
-
-def _err(msg: str) -> list[TextContent]:
-    return [TextContent(type="text", text=f"Error: {msg}")]

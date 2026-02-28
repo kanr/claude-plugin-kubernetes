@@ -36,6 +36,7 @@ from mcp.types import (
     TextResourceContents,
 )
 
+from k8s_mcp.formatters import ToolError
 from k8s_mcp.prompts import ALL_PROMPTS, get_prompt
 from k8s_mcp.resources import RESOURCE_TEMPLATES, STATIC_RESOURCES, read_resource
 from k8s_mcp.tools.awareness import AWARENESS_HANDLERS, AWARENESS_TOOLS
@@ -94,7 +95,8 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
 
     try:
         content = await handler(args)
-        return CallToolResult(content=content)
+        is_error = isinstance(content, ToolError)
+        return CallToolResult(content=content, isError=is_error)
     except Exception as exc:  # noqa: BLE001
         return CallToolResult(
             content=[TextContent(type="text", text=f"Unexpected error: {exc}")],

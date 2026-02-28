@@ -314,11 +314,13 @@ _SIMPLE_LIST_NS_HANDLERS = [
 
 @pytest.mark.parametrize("handler", _SIMPLE_LIST_NS_HANDLERS, ids=lambda h: h.__name__)
 async def test_simple_list_ns_success(handler):
-    """All _simple_list-backed handlers should return kubectl output on success."""
-    with patch("k8s_mcp.tools.awareness.kubectl", return_value="resource-output"):
+    """All _simple_list-backed handlers should return kubectl output with a summary."""
+    with patch("k8s_mcp.tools.awareness.kubectl", return_value="NAME   READY\nfoo    1/1"):
         result = await handler({})
     assert len(result) == 1
-    assert result[0].text == "resource-output"
+    # Should contain both the summary line and the original output
+    assert "foo" in result[0].text
+    assert "1" in result[0].text  # count in summary
 
 
 @pytest.mark.parametrize("handler", _SIMPLE_LIST_NS_HANDLERS, ids=lambda h: h.__name__)
